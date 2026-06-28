@@ -1,0 +1,37 @@
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const requiredEnv = ['MONGO_URI', 'JWT_SECRET', 'JWT_REFRESH_SECRET'];
+
+for (const key of requiredEnv) {
+  if (!process.env[key]) {
+    console.warn(`Warning: ${key} is not set in environment variables.`);
+  }
+}
+
+export const env = {
+  port: parseInt(process.env.PORT, 10) || 5000,
+  mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/vapepass',
+  jwtSecret: process.env.JWT_SECRET,
+  jwtExpires: process.env.JWT_EXPIRES || '15m',
+  jwtRefreshSecret: process.env.JWT_REFRESH_SECRET,
+  jwtRefreshExpires: process.env.JWT_REFRESH_EXPIRES || '7d',
+  clientUrl: process.env.CLIENT_URL || 'http://localhost:3000',
+  passkit: {
+    apiKey: process.env.PASSKIT_API_KEY,
+    apiSecret: process.env.PASSKIT_API_SECRET,
+    programId: process.env.PASSKIT_PROGRAM_ID,
+  },
+  stripe: {
+    secretKey: process.env.STRIPE_SECRET_KEY,
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+    priceId: process.env.STRIPE_PRICE_ID,
+  },
+  cloudinary: {
+    cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+    apiKey: process.env.CLOUDINARY_API_KEY,
+    apiSecret: process.env.CLOUDINARY_API_SECRET,
+  },
+  nodeEnv: process.env.NODE_ENV || 'development',
+};
