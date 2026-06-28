@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import mongoose from 'mongoose';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
 import { configureCloudinary } from './config/cloudinary.js';
@@ -38,9 +39,14 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   },
 }));
 
-// Health check
+// Health check (used by Railway / uptime monitors)
 app.get('/health', (req, res) => {
-  res.status(200).json({ success: true, message: 'VapePass API is running' });
+  const dbConnected = mongoose.connection.readyState === 1;
+  res.status(dbConnected ? 200 : 503).json({
+    success: dbConnected,
+    message: dbConnected ? 'VapePass API is running' : 'VapePass API is up but database is not connected',
+    database: dbConnected ? 'connected' : 'disconnected',
+  });
 });
 
 // API v1 routes
