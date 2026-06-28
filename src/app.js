@@ -2,7 +2,6 @@ import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import swaggerUi from 'swagger-ui-express';
-import { env } from './config/env.js';
 import { swaggerSpec } from './config/swagger.js';
 import { configureCloudinary } from './config/cloudinary.js';
 import webhookRoutes from './routes/webhook.routes.js';
@@ -14,10 +13,10 @@ const app = express();
 // Cloudinary (optional — logs warning if credentials missing)
 configureCloudinary();
 
-// CORS — allow frontend origin with credentials for refresh token cookies
+// CORS — allow all origins (reflects request origin for credentials support)
 app.use(
   cors({
-    origin: env.clientUrl,
+    origin: (_origin, callback) => callback(null, true),
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
