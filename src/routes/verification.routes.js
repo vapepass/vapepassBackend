@@ -6,7 +6,7 @@ import * as verificationController from '../controllers/verification.controller.
 
 const router = Router();
 
-router.use(authenticateUser, requireActiveSubscription);
+router.use(authenticateUser, ...requireActiveSubscription);
 
 router.post(
   '/',

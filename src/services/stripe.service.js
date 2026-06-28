@@ -1,6 +1,8 @@
 import { env } from '../config/env.js';
 import Store from '../models/Store.js';
+import ProcessedStripeEvent from '../models/ProcessedStripeEvent.js';
 import { ApiError, SUBSCRIPTION_STATUS } from '../utils/constants.js';
+import { mapStripeSubscriptionStatus } from '../utils/stripeStatus.js';
 
 const MONTHLY_PRICE_CENTS = 9900; // $99/month per project doc
 
@@ -92,10 +94,18 @@ export const createBillingPortalSession = async (store) => {
 };
 
 export const handleWebhookEvent = async (event) => {
+  const alreadyProcessed = await ProcessedStripeEvent.findOne({ eventId: event.id });
+  if (alreadyProcessed) {
+    return { duplicate: true };
+  }
+
   const obj = event.data.object;
   const store = await findStoreFromStripeObject(obj);
 
-  if (!store) return;
+  if (!store) {
+    await ProcessedStripeEvent.create({ eventId: event.id, type: event.type });
+    return { storeFound: false };
+  }
 
   switch (event.type) {
     case 'checkout.session.completed':
@@ -108,18 +118,13 @@ export const handleWebhookEvent = async (event) => {
     case 'customer.subscription.created':
     case 'customer.subscription.updated': {
       store.stripeSubscriptionId = obj.id;
-      if (obj.status === 'active' || obj.status === 'trialing') {
-        store.subscriptionStatus = SUBSCRIPTION_STATUS.ACTIVE;
-      } else if (obj.status === 'past_due' || obj.status === 'unpaid') {
-        store.subscriptionStatus = SUBSCRIPTION_STATUS.PAUSED;
-      } else if (obj.status === 'canceled' || obj.status === 'cancelled') {
-        store.subscriptionStatus = SUBSCRIPTION_STATUS.CANCELLED;
-      }
+      const mapped = mapStripeSubscriptionStatus(obj.status);
+      if (mapped) store.subscriptionStatus = mapped;
       break;
     }
 
     case 'invoice.payment_failed':
-      store.subscriptionStatus = SUBSCRIPTION_STATUS.PAUSED;
+      store.subscriptionStatus = SUBSCRIPTION_STATUS.PAST_DUE;
       break;
 
     case 'customer.subscription.deleted':
@@ -128,10 +133,14 @@ export const handleWebhookEvent = async (event) => {
       break;
 
     default:
-      return;
+      await ProcessedStripeEvent.create({ eventId: event.id, type: event.type });
+      return { handled: false };
   }
 
   await store.save();
+  await ProcessedStripeEvent.create({ eventId: event.id, type: event.type });
+
+  return { handled: true, storeId: store._id };
 };
 
 export const getBillingInfo = () => ({

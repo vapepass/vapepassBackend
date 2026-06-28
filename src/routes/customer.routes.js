@@ -11,7 +11,7 @@ import * as customerController from '../controllers/customer.controller.js';
 
 const router = Router();
 
-router.use(authenticateUser, requireActiveSubscription);
+router.use(authenticateUser, ...requireActiveSubscription);
 
 router.get('/stats', customerController.getStats);
 

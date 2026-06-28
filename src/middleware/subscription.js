@@ -1,28 +1,27 @@
-import Store from '../models/Store.js';
 import { ApiError, SUBSCRIPTION_STATUS } from '../utils/constants.js';
 import { asyncHandler } from './asyncHandler.js';
+import { resolveStore } from './resolveStore.js';
+
+const BLOCKED_STATUSES = [
+  SUBSCRIPTION_STATUS.PAST_DUE,
+  SUBSCRIPTION_STATUS.CANCELLED,
+  SUBSCRIPTION_STATUS.PAUSED,
+];
 
 /**
- * Blocks dashboard actions when subscription is paused or cancelled.
+ * Blocks dashboard actions when subscription is inactive.
+ * Requires resolveStore (or sets req.store via resolveStore logic).
  */
-export const requireActiveSubscription = asyncHandler(async (req, res, next) => {
-  if (!req.user?.storeId) {
-    throw new ApiError(403, 'No store associated with this account');
-  }
+export const requireActiveSubscription = [
+  resolveStore,
+  asyncHandler(async (req, res, next) => {
+    if (BLOCKED_STATUSES.includes(req.store.subscriptionStatus)) {
+      throw new ApiError(
+        402,
+        'Your subscription is inactive. Please update billing in Business Settings to continue.'
+      );
+    }
 
-  const store = await Store.findById(req.user.storeId).select('subscriptionStatus name');
-
-  if (!store) throw new ApiError(404, 'Store not found');
-
-  const blocked = [SUBSCRIPTION_STATUS.PAST_DUE, SUBSCRIPTION_STATUS.CANCELLED, SUBSCRIPTION_STATUS.PAUSED];
-
-  if (blocked.includes(store.subscriptionStatus)) {
-    throw new ApiError(
-      402,
-      'Your subscription is inactive. Please update billing in Business Settings to continue.'
-    );
-  }
-
-  req.store = store;
-  next();
-});
+    next();
+  }),
+];

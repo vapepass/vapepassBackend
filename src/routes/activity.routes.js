@@ -7,7 +7,7 @@ import * as activityController from '../controllers/activity.controller.js';
 
 const router = Router();
 
-router.use(authenticateUser, requireActiveSubscription);
+router.use(authenticateUser, ...requireActiveSubscription);
 
 router.get('/', validate(activityListValidator), activityController.listActivity);
 

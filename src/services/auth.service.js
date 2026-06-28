@@ -8,6 +8,7 @@ import {
   generateRefreshToken,
   verifyRefreshToken,
 } from './token.service.js';
+import { sendPasswordResetEmail } from './email.service.js';
 
 export const registerUser = async ({
   firstName,
@@ -112,7 +113,12 @@ export const forgotPassword = async (email) => {
   user.passwordResetExpires = Date.now() + 60 * 60 * 1000; // 1 hour
   await user.save({ validateBeforeSave: false });
 
-  // In production, send email with reset link containing resetToken
+  try {
+    await sendPasswordResetEmail(user.email, resetToken);
+  } catch (error) {
+    console.error(`[email] Failed to send password reset to ${user.email}:`, error.message);
+  }
+
   return { resetToken, email: user.email };
 };
 

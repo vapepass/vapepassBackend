@@ -40,6 +40,14 @@ npm run dev
 - Swagger docs: `http://localhost:5000/api-docs`
 - Health check: `http://localhost:5000/health`
 
+## Testing
+
+```bash
+npm test
+```
+
+Covers auth flows, tenant isolation, employee invites, Stripe status mapping, and webhook idempotency.
+
 ## API Overview
 
 ### Authentication (`/api/v1/auth`)
@@ -51,14 +59,32 @@ npm run dev
 | POST   | `/logout`          | Required | Clear refresh token            |
 | POST   | `/forgot-password` | Public   | Request password reset         |
 | POST   | `/reset-password`  | Public   | Reset password with token      |
+| POST   | `/refresh`         | Public   | Refresh access token (cookie)  |
 | GET    | `/profile`         | Required | Get current user profile       |
 
 ### Store (`/api/v1/store`)
 
-| Method | Endpoint    | Auth              | Description              |
-|--------|-------------|-------------------|--------------------------|
-| GET    | `/`         | Required          | Get user's store         |
-| PUT    | `/settings` | Store owner only  | Update store settings    |
+| Method | Endpoint              | Auth              | Description              |
+|--------|-----------------------|-------------------|--------------------------|
+| GET    | `/`                   | Required          | Get user's store         |
+| PUT    | `/settings`           | Store owner only  | Update store settings    |
+| GET    | `/employees`          | Store owner only  | List store employees     |
+| POST   | `/employees`          | Store owner only  | Invite employee account  |
+| DELETE | `/employees/:id`      | Store owner only  | Deactivate employee      |
+
+### Billing (`/api/v1/billing`)
+
+| Method | Endpoint    | Auth              | Description                    |
+|--------|-------------|-------------------|--------------------------------|
+| GET    | `/`         | Store owner only  | Get plan info ($99/month)      |
+| POST   | `/checkout` | Store owner only  | Create Stripe Checkout session |
+| POST   | `/portal`   | Store owner only  | Open Stripe Customer Portal    |
+
+### Webhooks
+
+| Method | Endpoint                    | Auth   | Description              |
+|--------|-----------------------------|--------|--------------------------|
+| POST   | `/api/v1/webhooks/stripe`   | Stripe | Subscription lifecycle   |
 
 ## Sample Requests (cURL)
 
@@ -188,8 +214,20 @@ Set these **Environment Variables** in the Railway service (`.env` is not deploy
 | `JWT_REFRESH_SECRET` | long random string |
 | `CLIENT_URL` | `https://vapepass.vercel.app` |
 | `NODE_ENV` | `production` |
+| `SMTP_HOST` | Your SMTP host (password reset emails) |
+| `SMTP_PORT` | `587` |
+| `SMTP_USER` | SMTP username |
+| `SMTP_PASS` | SMTP password |
+| `EMAIL_FROM` | `VapePass <noreply@yourdomain.com>` |
+| `STRIPE_SECRET_KEY` | Stripe secret key |
+| `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret |
+| `STRIPE_PRICE_ID` | Stripe recurring price ID ($99/month) |
 
 **MongoDB Atlas:** In Network Access, allow `0.0.0.0/0` so Railway can connect.
+
+**Stripe webhook URL:** `https://your-app.up.railway.app/api/v1/webhooks/stripe`
+
+Subscribe to events: `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.payment_failed`.
 
 **Verify:** After deploy, open `https://your-app.up.railway.app/health` — you should see JSON, not a Railway error page.
 

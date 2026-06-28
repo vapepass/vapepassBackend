@@ -10,7 +10,7 @@ const router = Router();
 router.get(
   '/dashboard',
   authenticateUser,
-  requireActiveSubscription,
+  ...requireActiveSubscription,
   authorizeRoles(ROLES.STORE_OWNER, ROLES.EMPLOYEE),
   analyticsController.getDashboard
 );

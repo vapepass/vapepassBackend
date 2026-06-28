@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "test": "node --test tests/**/*.test.js",
     "seed:admin": "node scripts/seed-admin.js"
   },
   "keywords": [
@@ -27,8 +28,13 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.16.0",
     "multer": "^2.0.1",
+    "nodemailer": "^9.0.1",
     "stripe": "^18.5.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^10.4.3",
+    "supertest": "^7.2.2"
   }
 }

@@ -186,6 +186,18 @@ router.post(
  */
 router.get('/profile', authenticateUser, authController.getProfile);
 
+/**
+ * @swagger
+ * /auth/refresh:
+ *   post:
+ *     summary: Refresh access token using HTTP-only refresh cookie
+ *     tags: [Auth]
+ *     responses:
+ *       200:
+ *         description: New access token issued
+ *       401:
+ *         description: Refresh token missing or invalid
+ */
 router.post('/refresh', authController.refresh);
 
 export default router;
