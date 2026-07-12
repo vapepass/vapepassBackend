@@ -1,3 +1,5 @@
+import path from 'path';
+import { fileURLToPath } from 'url';
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -8,6 +10,9 @@ import { configureCloudinary } from './config/cloudinary.js';
 import webhookRoutes from './routes/webhook.routes.js';
 import apiRoutes from './routes/index.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 
@@ -47,6 +52,14 @@ app.get('/health', (req, res) => {
     message: dbConnected ? 'VapePass API is running' : 'VapePass API is up but database is not connected',
     database: dbConnected ? 'connected' : 'disconnected',
   });
+});
+
+// Embeddable VapePass Assistant widget (Shadow DOM)
+app.get('/widget.js', (req, res) => {
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.sendFile(path.join(__dirname, '../public/widget.js'));
 });
 
 // API v1 routes

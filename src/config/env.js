@@ -41,5 +41,15 @@ export const env = {
     pass: process.env.SMTP_PASS,
     from: process.env.EMAIL_FROM,
   },
+  openai: {
+    apiKey: process.env.OPENAI_API_KEY,
+    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+  },
+  scrapingBee: {
+    apiKey: process.env.SCRAPINGBEE_API_KEY,
+  },
+  cronSecret: process.env.CRON_SECRET,
+  enableInternalCron: process.env.ENABLE_INTERNAL_CRON === 'true',
+  apiPublicUrl: process.env.API_PUBLIC_URL || process.env.CLIENT_URL || 'http://localhost:5000',
   nodeEnv: process.env.NODE_ENV || 'development',
 };

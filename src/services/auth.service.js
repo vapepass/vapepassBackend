@@ -17,6 +17,9 @@ export const registerUser = async ({
   password,
   role = ROLES.STORE_OWNER,
   storeName,
+  country,
+  province,
+  address,
 }) => {
   const existingUser = await User.findOne({ email });
   if (existingUser) {
@@ -42,6 +45,9 @@ export const registerUser = async ({
   const store = await Store.create({
     name: storeName || `${firstName}'s Store`,
     createdBy: user._id,
+    country: country || 'CA',
+    province: province || null,
+    address: address || null,
   });
 
   user.storeId = store._id;

@@ -46,7 +46,37 @@ npm run dev
 npm test
 ```
 
-Covers auth flows, tenant isolation, employee invites, Stripe status mapping, and webhook idempotency.
+Covers auth flows, tenant isolation, employee invites, Stripe status mapping, webhook idempotency, BC compliance, and the AI Assistant.
+
+## VapePass Assistant
+
+AI chatbot widget that recommends products only from each store's live MongoDB inventory, with hardcoded BC compliance.
+
+### Environment
+
+```env
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+SCRAPINGBEE_API_KEY=
+CRON_SECRET=change-me-cron-secret
+API_PUBLIC_URL=http://localhost:5000
+ENABLE_INTERNAL_CRON=false
+```
+
+### Onboarding flow
+
+1. Store submits product page URL (setup or **AI Assistant** dashboard page)
+2. Scraper (ScrapingBee, Playwright fallback) syncs inventory to MongoDB
+3. Store copies one-line embed code onto their website
+4. Daily cron refreshes inventory (`POST /api/v1/cron/sync-inventory` with `CRON_SECRET`)
+
+### Embed code
+
+```html
+<script src="https://YOUR_API_HOST/widget.js" data-store-id="STORE_ID" async></script>
+```
+
+Optional: set `data-require-site-age="true"` to keep the widget hidden until the host site sets `localStorage.vapepass_site_age_verified = "true"` (or `age_verified`).
 
 ## API Overview
 
@@ -79,6 +109,24 @@ Covers auth flows, tenant isolation, employee invites, Stripe status mapping, an
 | GET    | `/`         | Store owner only  | Get plan info ($99/month)      |
 | POST   | `/checkout` | Store owner only  | Create Stripe Checkout session |
 | POST   | `/portal`   | Store owner only  | Open Stripe Customer Portal    |
+
+### Assistant (`/api/v1/assistant`)
+
+| Method | Endpoint              | Auth             | Description                          |
+|--------|-----------------------|------------------|--------------------------------------|
+| GET    | `/widget/:storeId`    | Public           | Widget bootstrap config              |
+| POST   | `/session`            | Public           | Start/resume chat session            |
+| POST   | `/chat`               | Public           | Send customer message                |
+| GET    | `/status`             | Required         | Embed code + sync status             |
+| PUT    | `/product-url`        | Store owner only | Set product page URL + sync          |
+| POST   | `/sync`               | Store owner only | Manual inventory sync                |
+| GET    | `/inventory`          | Required         | List synced products                 |
+
+### Cron (`/api/v1/cron`)
+
+| Method | Endpoint            | Auth         | Description                    |
+|--------|---------------------|--------------|--------------------------------|
+| POST   | `/sync-inventory`   | Cron secret  | Daily inventory sync all stores|
 
 ### Webhooks
 

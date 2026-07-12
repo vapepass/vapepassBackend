@@ -42,6 +42,24 @@ export const registerValidator = [
     .trim()
     .isLength({ max: 120 })
     .withMessage('Store name cannot exceed 120 characters'),
+
+  body('country')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 100 })
+    .withMessage('Country cannot exceed 100 characters'),
+
+  body('province')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 100 })
+    .withMessage('Province cannot exceed 100 characters'),
+
+  body('address')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 500 })
+    .withMessage('Address cannot exceed 500 characters'),
 ];
 
 export const loginValidator = [

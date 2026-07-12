@@ -7,8 +7,10 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test tests/**/*.test.js",
-    "seed:admin": "node scripts/seed-admin.js"
+    "test": "node --test tests/",
+    "seed:admin": "node scripts/seed-admin.js",
+    "sync:inventory": "node scripts/sync-inventory.js",
+    "verify:stores": "node scripts/verify-priority-stores.js"
   },
   "keywords": [
     "vapepass",

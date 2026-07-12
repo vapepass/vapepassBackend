@@ -26,4 +26,28 @@ export const storeSettingsValidator = [
     .toInt()
     .isInt({ min: 1, max: 50 })
     .withMessage('Stamp goal must be between 1 and 50'),
+
+  body('productPageUrl')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 2048 })
+    .withMessage('Product page URL cannot exceed 2048 characters'),
+
+  body('address')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 500 })
+    .withMessage('Address cannot exceed 500 characters'),
+
+  body('country')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 100 })
+    .withMessage('Country cannot exceed 100 characters'),
+
+  body('province')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 100 })
+    .withMessage('Province cannot exceed 100 characters'),
 ];

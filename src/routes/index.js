@@ -8,6 +8,8 @@ import billingRoutes from './billing.routes.js';
 import analyticsRoutes from './analytics.routes.js';
 import adminRoutes from './admin.routes.js';
 import publicRoutes from './public.routes.js';
+import assistantRoutes from './assistant.routes.js';
+import cronRoutes from './cron.routes.js';
 
 const router = Router();
 
@@ -20,5 +22,7 @@ router.use('/activity', activityRoutes);
 router.use('/billing', billingRoutes);
 router.use('/analytics', analyticsRoutes);
 router.use('/admin', adminRoutes);
+router.use('/assistant', assistantRoutes);
+router.use('/cron', cronRoutes);
 
 export default router;
