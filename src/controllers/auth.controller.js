@@ -83,6 +83,12 @@ export const getProfile = asyncHandler(async (req, res) => {
   return sendSuccess(res, 200, 'Profile retrieved successfully', { user });
 });
 
+export const updateProfile = asyncHandler(async (req, res) => {
+  const user = await authService.updateUserProfile(req.user._id, req.body);
+
+  return sendSuccess(res, 200, 'Profile updated successfully', { user });
+});
+
 export const refresh = asyncHandler(async (req, res) => {
   const token = req.cookies?.refreshToken;
 

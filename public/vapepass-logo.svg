@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="48" viewBox="0 0 180 48" role="img" aria-label="VapePass">
+  <rect width="48" height="48" rx="12" fill="#ffffff"/>
+  <path d="M24 10l3 9 9 3-9 3-3 9-3-9-9-3 9-3 3-9z" fill="#7c3aed"/>
+  <path d="M14 34l1.5 4.5L20 40l-4.5 1.5L14 46l-1.5-4.5L8 40l4.5-1.5L14 34z" fill="#a78bfa"/>
+  <text x="60" y="31" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="22" font-weight="800" fill="#ffffff">VapePass</text>
+</svg>

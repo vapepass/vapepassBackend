@@ -4,20 +4,33 @@ import * as assistantService from '../services/assistant.service.js';
 import * as inventoryService from '../services/inventory.service.js';
 
 export const getWidgetConfig = asyncHandler(async (req, res) => {
-  const config = await assistantService.getWidgetConfig(req.params.storeId);
+  const config = await assistantService.getWidgetConfig(req.params.storeId, {
+    store: req.embedStore,
+    domainDenied: req.embedDomainDenied,
+    demoMode: req.embedDemoMode,
+  });
   return sendSuccess(res, 200, 'Widget config retrieved', { config });
 });
 
 export const startSession = asyncHandler(async (req, res) => {
   const { storeId, sessionKey } = req.body;
-  const session = await assistantService.startSession(storeId, sessionKey);
+  const session = await assistantService.startSession(storeId, sessionKey, {
+    demoMode: req.embedDemoMode,
+  });
   return sendSuccess(res, 200, 'Session started', { session });
 });
 
 export const sendMessage = asyncHandler(async (req, res) => {
   const { storeId, sessionKey, message } = req.body;
-  const result = await assistantService.sendMessage(storeId, sessionKey, message);
+  const result = await assistantService.sendMessage(storeId, sessionKey, message, {
+    demoMode: req.embedDemoMode,
+  });
   return sendSuccess(res, 200, 'Message processed', { session: result });
+});
+
+export const goLive = asyncHandler(async (req, res) => {
+  const status = await inventoryService.goLive(req.user);
+  return sendSuccess(res, 200, 'Store is live. Chatbot is now active.', { status });
 });
 
 export const getAssistantStatus = asyncHandler(async (req, res) => {
@@ -37,19 +50,14 @@ export const setProductPageUrl = asyncHandler(async (req, res) => {
 });
 
 export const syncInventory = asyncHandler(async (req, res) => {
-  const Store = (await import('../models/Store.js')).default;
-  await Store.findByIdAndUpdate(req.user.storeId, {
-    inventorySyncStatus: 'syncing',
-    inventorySyncError: null,
-  });
+  // Prefer quota-aware refresh for dashboard "Refresh Inventory"
+  const result = await inventoryService.refreshInventory(req.user);
+  return sendSuccess(res, 202, 'Inventory refresh started', result);
+});
 
-  // Start sync in background; client polls /assistant/status for completion
-  inventoryService.syncStoreInventory(req.user.storeId).catch((error) => {
-    console.error('[assistant] Manual inventory sync failed:', error.message);
-  });
-
-  const status = await inventoryService.getAssistantStatus(req.user);
-  return sendSuccess(res, 202, 'Inventory sync started', { status });
+export const refreshInventory = asyncHandler(async (req, res) => {
+  const result = await inventoryService.refreshInventory(req.user);
+  return sendSuccess(res, 202, 'Inventory refresh started', result);
 });
 
 export const listInventory = asyncHandler(async (req, res) => {

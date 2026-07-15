@@ -33,11 +33,23 @@ export const storeSettingsValidator = [
     .isLength({ max: 2048 })
     .withMessage('Product page URL cannot exceed 2048 characters'),
 
+  body('websiteUrl')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 2048 })
+    .withMessage('Website URL cannot exceed 2048 characters'),
+
   body('address')
     .optional({ values: 'falsy' })
     .trim()
     .isLength({ max: 500 })
     .withMessage('Address cannot exceed 500 characters'),
+
+  body('city')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 120 })
+    .withMessage('City cannot exceed 120 characters'),
 
   body('country')
     .optional({ values: 'falsy' })

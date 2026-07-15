@@ -1,6 +1,7 @@
 import User from '../models/User.js';
 import Store from '../models/Store.js';
-import { ApiError, ROLES } from '../utils/constants.js';
+import { ApiError, ROLES, SUBSCRIPTION_PLANS } from '../utils/constants.js';
+import { extractHostname } from '../utils/domain.js';
 import { generateResetToken, hashToken } from '../utils/token.js';
 import { sanitizeUser } from '../utils/user.js';
 import {
@@ -10,16 +11,60 @@ import {
 } from './token.service.js';
 import { sendPasswordResetEmail } from './email.service.js';
 
+function normalizeWebsiteUrl(rawUrl) {
+  if (!rawUrl) return null;
+  let url = String(rawUrl).trim();
+  if (!url) return null;
+  if (!/^https?:\/\//i.test(url)) {
+    url = `https://${url}`;
+  }
+  try {
+    return new URL(url).toString();
+  } catch {
+    throw new ApiError(400, 'Please provide a valid website URL');
+  }
+}
+
+function splitOwnerName(ownerName, firstName, lastName) {
+  if (firstName && lastName) {
+    return { firstName: firstName.trim(), lastName: lastName.trim() };
+  }
+
+  const parts = String(ownerName || '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (parts.length >= 2) {
+    return {
+      firstName: parts[0],
+      lastName: parts.slice(1).join(' '),
+    };
+  }
+
+  if (parts.length === 1) {
+    return { firstName: parts[0], lastName: 'Owner' };
+  }
+
+  return { firstName: firstName || 'Store', lastName: lastName || 'Owner' };
+}
+
 export const registerUser = async ({
   firstName,
   lastName,
+  ownerName,
   email,
   password,
+  phone,
   role = ROLES.STORE_OWNER,
   storeName,
+  websiteUrl,
+  productPageUrl,
   country,
   province,
+  city,
   address,
+  subscriptionPlan,
 }) => {
   const existingUser = await User.findOne({ email });
   if (existingUser) {
@@ -34,20 +79,38 @@ export const registerUser = async ({
     throw new ApiError(403, 'Admin accounts cannot be created via public registration');
   }
 
+  const names = splitOwnerName(ownerName, firstName, lastName);
+  const website = normalizeWebsiteUrl(websiteUrl || productPageUrl);
+
+  if (!website) {
+    throw new ApiError(400, 'Website URL is required');
+  }
+
+  if (!storeName?.trim()) {
+    throw new ApiError(400, 'Store name is required');
+  }
+
   const user = await User.create({
-    firstName,
-    lastName,
+    firstName: names.firstName,
+    lastName: names.lastName,
     email,
+    phone: phone || null,
     password,
     role: ROLES.STORE_OWNER,
   });
 
   const store = await Store.create({
-    name: storeName || `${firstName}'s Store`,
+    name: storeName.trim(),
     createdBy: user._id,
+    websiteUrl: website,
+    productPageUrl: website,
+    allowedHostname: extractHostname(website),
     country: country || 'CA',
     province: province || null,
+    city: city || null,
     address: address || null,
+    subscriptionPlan: subscriptionPlan || SUBSCRIPTION_PLANS.PRO,
+    inventorySyncStatus: 'idle',
   });
 
   user.storeId = store._id;
@@ -102,6 +165,23 @@ export const getUserProfile = async (userId) => {
     throw new ApiError(404, 'User not found');
   }
 
+  return sanitizeUser(user);
+};
+
+export const updateUserProfile = async (userId, updates = {}) => {
+  const user = await User.findById(userId);
+  if (!user) {
+    throw new ApiError(404, 'User not found');
+  }
+
+  if (updates.firstName !== undefined) user.firstName = String(updates.firstName).trim();
+  if (updates.lastName !== undefined) user.lastName = String(updates.lastName).trim();
+  if (updates.phone !== undefined) {
+    const phone = String(updates.phone || '').trim();
+    user.phone = phone || null;
+  }
+
+  await user.save();
   return sanitizeUser(user);
 };
 

@@ -111,14 +111,53 @@ export function resolveStoreLegalAge(store) {
   return getLegalAge(store.country, store.province);
 }
 
+const CANADA_PROVINCE_LABELS = {
+  AB: 'Alberta',
+  ALBERTA: 'Alberta',
+  BC: 'British Columbia',
+  'BRITISH COLUMBIA': 'British Columbia',
+  MB: 'Manitoba',
+  MANITOBA: 'Manitoba',
+  NB: 'New Brunswick',
+  'NEW BRUNSWICK': 'New Brunswick',
+  NL: 'Newfoundland and Labrador',
+  'NEWFOUNDLAND AND LABRADOR': 'Newfoundland and Labrador',
+  NEWFOUNDLAND: 'Newfoundland and Labrador',
+  NS: 'Nova Scotia',
+  'NOVA SCOTIA': 'Nova Scotia',
+  NT: 'Northwest Territories',
+  'NORTHWEST TERRITORIES': 'Northwest Territories',
+  NU: 'Nunavut',
+  NUNAVUT: 'Nunavut',
+  ON: 'Ontario',
+  ONTARIO: 'Ontario',
+  PE: 'Prince Edward Island',
+  'PRINCE EDWARD ISLAND': 'Prince Edward Island',
+  QC: 'Quebec',
+  QUEBEC: 'Quebec',
+  QUÉBEC: 'Quebec',
+  SK: 'Saskatchewan',
+  SASKATCHEWAN: 'Saskatchewan',
+  YT: 'Yukon',
+  YUKON: 'Yukon',
+  'YUKON TERRITORY': 'Yukon',
+};
+
 /**
- * Human-readable region label for compliance copy.
+ * Human-readable region label for compliance copy and chatbot header.
+ * Examples: "British Columbia", "United States"
  */
 export function getRegionLabel(country, province) {
   const normalizedCountry = normalizeCountry(country);
-  if (normalizedCountry === 'US') return 'the United States';
+  if (normalizedCountry === 'US') return 'United States';
+  if (normalizedCountry === 'CA') {
+    const prov = normalizeProvince(province);
+    if (prov && CANADA_PROVINCE_LABELS[prov]) return CANADA_PROVINCE_LABELS[prov];
+    return 'Canada';
+  }
   const prov = normalizeProvince(province);
-  if (prov) return prov;
+  if (prov && CANADA_PROVINCE_LABELS[prov]) return CANADA_PROVINCE_LABELS[prov];
+  if (prov) return province;
   return 'this location';
 }
 

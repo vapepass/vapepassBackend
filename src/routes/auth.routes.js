@@ -6,6 +6,7 @@ import {
   loginValidator,
   forgotPasswordValidator,
   resetPasswordValidator,
+  updateProfileValidator,
 } from '../validators/auth.validator.js';
 import * as authController from '../controllers/auth.controller.js';
 
@@ -185,6 +186,13 @@ router.post(
  *                           $ref: '#/components/schemas/User'
  */
 router.get('/profile', authenticateUser, authController.getProfile);
+
+router.patch(
+  '/profile',
+  authenticateUser,
+  validate(updateProfileValidator),
+  authController.updateProfile
+);
 
 /**
  * @swagger

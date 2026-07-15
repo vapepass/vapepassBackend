@@ -15,8 +15,8 @@ describe('Stripe status mapping', () => {
     assert.equal(mapStripeSubscriptionStatus('unpaid'), SUBSCRIPTION_STATUS.PAST_DUE);
   });
 
-  test('maps canceled to cancelled', () => {
-    assert.equal(mapStripeSubscriptionStatus('canceled'), SUBSCRIPTION_STATUS.CANCELLED);
+  test('maps canceled to expired', () => {
+    assert.equal(mapStripeSubscriptionStatus('canceled'), SUBSCRIPTION_STATUS.EXPIRED);
   });
 });
 

@@ -16,4 +16,15 @@ const router = Router();
 router.post('/sync-inventory', authenticateCron, cronController.syncAllInventories);
 router.get('/sync-inventory', authenticateCron, cronController.syncAllInventories);
 
+router.post(
+  '/subscription-lifecycle',
+  authenticateCron,
+  cronController.runSubscriptionLifecycle
+);
+router.get(
+  '/subscription-lifecycle',
+  authenticateCron,
+  cronController.runSubscriptionLifecycle
+);
+
 export default router;

@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import { authenticateUser, authorizeRoles } from '../middleware/auth.js';
+import { loadEmbedStore, requireValidEmbedAccess } from '../middleware/embedSecurity.js';
+import { requireActiveSubscription } from '../middleware/subscription.js';
 import { validate } from '../middleware/validate.js';
 import { ROLES } from '../utils/constants.js';
 import {
@@ -32,6 +34,7 @@ const router = Router();
 router.get(
   '/widget/:storeId',
   validate(storeIdParamValidator),
+  loadEmbedStore,
   assistantController.getWidgetConfig
 );
 
@@ -45,6 +48,7 @@ router.get(
 router.post(
   '/session',
   validate(startSessionValidator),
+  requireValidEmbedAccess,
   assistantController.startSession
 );
 
@@ -58,11 +62,12 @@ router.post(
 router.post(
   '/chat',
   validate(chatMessageValidator),
+  requireValidEmbedAccess,
   assistantController.sendMessage
 );
 
 // Store-owner management routes
-router.use(authenticateUser);
+router.use(authenticateUser, ...requireActiveSubscription);
 
 /**
  * @swagger
@@ -108,6 +113,21 @@ router.post(
 
 /**
  * @swagger
+ * /assistant/refresh-inventory:
+ *   post:
+ *     summary: Manual inventory refresh (2 per month after initial scrape)
+ *     tags: [Assistant]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post(
+  '/refresh-inventory',
+  authorizeRoles(ROLES.STORE_OWNER),
+  assistantController.refreshInventory
+);
+
+/**
+ * @swagger
  * /assistant/inventory:
  *   get:
  *     summary: List synced inventory products for the store
@@ -131,6 +151,21 @@ router.patch(
   authorizeRoles(ROLES.STORE_OWNER),
   validate(priorityPromotionValidator),
   assistantController.setPriorityPromotion
+);
+
+/**
+ * @swagger
+ * /assistant/go-live:
+ *   post:
+ *     summary: Finish setup and activate the public chatbot
+ *     tags: [Assistant]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post(
+  '/go-live',
+  authorizeRoles(ROLES.STORE_OWNER),
+  assistantController.goLive
 );
 
 export default router;

@@ -1,5 +1,11 @@
 import nodemailer from 'nodemailer';
 import { env } from '../config/env.js';
+import {
+  buildPaymentFailedEmail,
+  buildRenewalReminderEmail,
+  buildSubscriptionActivatedEmail,
+  buildSubscriptionPausedEmail,
+} from '../utils/emailTemplates.js';
 
 let transporter = null;
 
@@ -23,6 +29,26 @@ function getTransporter() {
 
 export function isEmailConfigured() {
   return Boolean(env.email.host && env.email.from);
+}
+
+async function sendMail({ to, subject, text, html }) {
+  const transport = getTransporter();
+
+  if (!transport) {
+    console.warn(`[email] SMTP not configured. Would send to ${to}: ${subject}`);
+    console.warn(text);
+    return { sent: false, devFallback: true };
+  }
+
+  await transport.sendMail({
+    from: env.email.from,
+    to,
+    subject,
+    text,
+    html,
+  });
+
+  return { sent: true };
 }
 
 /**
@@ -62,4 +88,44 @@ export async function sendPasswordResetEmail(to, resetToken) {
   });
 
   return { sent: true };
+}
+
+export async function sendSubscriptionActivatedEmail(to, payload) {
+  const email = buildSubscriptionActivatedEmail(payload);
+  try {
+    return await sendMail({ to, ...email });
+  } catch (error) {
+    console.error(`[email] Failed subscription activated email to ${to}:`, error.message);
+    return { sent: false, error: error.message };
+  }
+}
+
+export async function sendRenewalReminderEmail(to, payload) {
+  const email = buildRenewalReminderEmail(payload);
+  try {
+    return await sendMail({ to, ...email });
+  } catch (error) {
+    console.error(`[email] Failed renewal reminder to ${to}:`, error.message);
+    return { sent: false, error: error.message };
+  }
+}
+
+export async function sendPaymentFailedEmail(to, payload) {
+  const email = buildPaymentFailedEmail(payload);
+  try {
+    return await sendMail({ to, ...email });
+  } catch (error) {
+    console.error(`[email] Failed payment-failed email to ${to}:`, error.message);
+    return { sent: false, error: error.message };
+  }
+}
+
+export async function sendSubscriptionPausedEmail(to, payload) {
+  const email = buildSubscriptionPausedEmail(payload);
+  try {
+    return await sendMail({ to, ...email });
+  } catch (error) {
+    console.error(`[email] Failed subscription paused email to ${to}:`, error.message);
+    return { sent: false, error: error.message };
+  }
 }

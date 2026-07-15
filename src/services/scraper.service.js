@@ -3,6 +3,12 @@ import https from 'https';
 import http from 'http';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/constants.js';
+import { cleanDescription } from '../utils/descriptionOptimize.js';
+import {
+  buildRichProduct,
+  explodeShopifyProduct,
+  explodeWooProduct,
+} from './scraper.catalog.js';
 
 // Prefer IPv4 — avoids ConnectTimeoutError on some Windows/network setups
 try {
@@ -16,17 +22,23 @@ const httpsAgent = new https.Agent({ family: 4, keepAlive: true });
 
 const NICOTINE_RE = /(\d+(?:\.\d+)?)\s*mg(?:\s*\/?\s*m[lL])?/i;
 const VOLUME_RE = /(\d+(?:\.\d+)?)\s*m[lL]\b/i;
-const POD_HINT_RE = /\b(pod|cartridge|pre[- ]?filled|disposable)\b/i;
-const BOTTLE_HINT_RE = /\b(e[- ]?liquid|e[- ]?juice|refill|bottle|salt\s*nic)\b/i;
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 1200;
-const MAX_PRODUCTS = 1000;
+/** Cap after variant explosion — supports large multi-variant catalogs */
+const MAX_PRODUCTS = 5000;
+
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+/** Skip ScrapingBee for the rest of the process after quota / auth failures */
+let scrapingBeeDisabled = false;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Fetch with exponential backoff retries.
+ * Honors HTTP 429 with longer waits; does not thrash on permanent 401/403.
  */
 async function withRetry(label, fn, retries = MAX_RETRIES) {
   let lastError;
@@ -36,17 +48,23 @@ async function withRetry(label, fn, retries = MAX_RETRIES) {
     } catch (error) {
       lastError = error;
       const status = error.status || error.statusCode;
-      // Do not retry permanent client errors (404/401/403)
-      const clientError = status && status >= 400 && status < 500 && status !== 429;
-      // Do not retry hard connect failures — host is unreachable from this network
+      const clientError =
+        status && status >= 400 && status < 500 && status !== 429;
       const connectError = /ETIMEDOUT|ECONNREFUSED|ENOTFOUND|Connect Timeout/i.test(
+        error.message || ''
+      );
+      const quotaError = /Monthly API calls limit|quota|credits/i.test(
         error.message || ''
       );
       console.warn(
         `[scraper] ${label} attempt ${attempt}/${retries} failed: ${error.message}`
       );
-      if (clientError || connectError || attempt >= retries) break;
-      await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
+      if (quotaError || clientError || connectError || attempt >= retries) break;
+      const retryAfterMs =
+        status === 429
+          ? Math.max(5000, RETRY_BASE_MS * 3 * attempt)
+          : RETRY_BASE_MS * 2 ** (attempt - 1);
+      await sleep(retryAfterMs);
     }
   }
   throw lastError;
@@ -109,20 +127,60 @@ function normalizeStoreUrl(url) {
 }
 
 /**
- * Fetch HTML via ScrapingBee (preferred) or Playwright.
+ * Fetch HTML via ScrapingBee (preferred), direct HTTP, or Playwright.
  */
 export async function fetchPageHtml(url) {
   const normalized = normalizeStoreUrl(url);
 
-  if (env.scrapingBee.apiKey) {
+  if (env.scrapingBee.apiKey && !scrapingBeeDisabled) {
     try {
       return await withRetry('ScrapingBee', () => fetchWithScrapingBee(normalized));
     } catch (error) {
-      console.error('[scraper] ScrapingBee exhausted retries, trying Playwright:', error.message);
+      if (/Monthly API calls limit|401|403|quota|credits/i.test(error.message || '')) {
+        scrapingBeeDisabled = true;
+        console.warn(
+          '[scraper] ScrapingBee disabled for this process (quota/auth). Using direct fetch / Playwright.'
+        );
+      } else {
+        console.error('[scraper] ScrapingBee exhausted retries, trying direct fetch:', error.message);
+      }
     }
   }
 
+  try {
+    return await withRetry('Direct HTML', () => fetchHtmlDirect(normalized));
+  } catch (error) {
+    console.warn(`[scraper] Direct HTML fetch failed: ${error.message}`);
+  }
+
   return withRetry('Playwright', () => fetchWithPlaywright(normalized));
+}
+
+async function fetchHtmlDirect(url) {
+  const response = await fetchWithTimeout(
+    url,
+    {
+      method: 'GET',
+      headers: {
+        Accept: 'text/html,application/xhtml+xml',
+        'User-Agent': BROWSER_UA,
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    },
+    45000
+  );
+
+  if (!response.ok) {
+    const error = new Error(`HTML fetch HTTP ${response.status} for ${url}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  const html = await response.text();
+  if (!html || html.length < 40) {
+    throw new Error(`Empty HTML response for ${url}`);
+  }
+  return html;
 }
 
 async function fetchWithScrapingBee(url) {
@@ -142,7 +200,9 @@ async function fetchWithScrapingBee(url) {
 
   if (!response.ok) {
     const body = await response.text().catch(() => '');
-    throw new Error(`ScrapingBee HTTP ${response.status}: ${body.slice(0, 200)}`);
+    const error = new Error(`ScrapingBee HTTP ${response.status}: ${body.slice(0, 200)}`);
+    error.status = response.status;
+    throw error;
   }
 
   return response.text();
@@ -179,14 +239,15 @@ async function fetchWithPlaywright(url) {
 
 /**
  * Direct JSON fetch (no browser) — used for Shopify / WooCommerce APIs.
+ * Uses a browser User-Agent; Shopify rate-limits obvious bots aggressively.
  */
 async function fetchJson(url) {
   const response = await fetchWithTimeout(url, {
     method: 'GET',
     headers: {
       Accept: 'application/json',
-      'User-Agent':
-        'Mozilla/5.0 (compatible; VapePassInventoryBot/1.0; +https://vapepass.app)',
+      'User-Agent': BROWSER_UA,
+      'Accept-Language': 'en-US,en;q=0.9',
     },
   });
 
@@ -268,22 +329,28 @@ function nodeHttpRequest(url, options = {}, timeoutMs = 45000) {
 }
 
 /**
- * Scrape Shopify catalog via public /products.json (paginated).
+ * Intelligent Shopify crawl:
+ * 1) products.json first (variants exploded) — avoids 429 from collection fan-out
+ * 2) optional collections pass for richer category labels when rate limit allows
  */
 export async function scrapeShopify(storeUrl) {
   const origin = originOf(storeUrl);
   const products = [];
+  const seen = new Set();
+  const descriptionPool = new Map();
+
+  console.log(`[scraper] Shopify intelligent crawl: ${origin}`);
+
+  // PRIMARY — full catalog via products.json (one endpoint, paginated)
   let page = 1;
-
-  console.log(`[scraper] Shopify catalog scrape: ${origin}`);
-
   while (products.length < MAX_PRODUCTS) {
     const endpoint = `${origin}/products.json?limit=250&page=${page}`;
     let data;
     try {
-      data = await withRetry(`Shopify page ${page}`, () => fetchJson(endpoint));
+      data = await withRetry(`Shopify products page ${page}`, () => fetchJson(endpoint));
     } catch (error) {
       if (page === 1) throw error;
+      console.warn(`[scraper] Shopify products pagination stopped: ${error.message}`);
       break;
     }
 
@@ -292,41 +359,166 @@ export async function scrapeShopify(storeUrl) {
 
     for (const item of batch) {
       if (item.status && item.status !== 'active') continue;
-      const title = cleanText(item.title || '');
-      if (!title) continue;
-
-      const handle = item.handle || String(item.id);
-      const productUrl = `${origin}/products/${handle}`;
-      const variantText = (item.variants || [])
-        .map((v) => v.title)
-        .filter(Boolean)
-        .join(' ');
-      const combined = `${title} ${variantText} ${item.product_type || ''} ${item.vendor || ''}`;
-
-      products.push(
-        buildProduct(title, productUrl, {
-          brand: item.vendor || null,
-          externalId: `shopify:${handle}`,
-          platform: 'shopify',
-          textForSpecs: combined,
-        })
+      const subcategory =
+        item.tags
+          ? String(item.tags)
+              .split(',')
+              .map((t) => t.trim())
+              .filter(Boolean)[0]
+          : null;
+      const exploded = explodeShopifyProduct(
+        item,
+        origin,
+        {
+          category: item.product_type || null,
+          subcategory:
+            subcategory && subcategory !== item.product_type ? subcategory : null,
+          categoryDescription: null,
+        },
+        descriptionPool
       );
+      for (const row of exploded) {
+        if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
+        seen.add(row.externalId);
+        products.push(row);
+      }
     }
+
+    console.log(
+      `[scraper] Shopify products.json page ${page}: +${batch.length} parents → ${products.length} variants total`
+    );
 
     if (batch.length < 250) break;
     page += 1;
+    await sleep(400);
   }
 
-  console.log(`[scraper] Shopify: ${products.length} products from ${origin}`);
+  // OPTIONAL — enrich category / subcategory from collections (best-effort, paced)
+  if (products.length > 0) {
+    try {
+      await sleep(600);
+      const collections = await fetchShopifyCollections(origin, 40);
+      if (collections.length) {
+        console.log(
+          `[scraper] Shopify: enriching categories from up to ${collections.length} collections`
+        );
+        let enriched = 0;
+        for (const collection of collections) {
+          if (enriched >= 25) break;
+          try {
+            await sleep(300);
+            const collectionProducts = await fetchShopifyCollectionProducts(
+              origin,
+              collection.handle,
+              2
+            );
+            const category = cleanText(collection.title || collection.handle || 'Collection');
+            const categoryDescription = cleanDescription(collection.body_html || '');
+            const handleSet = new Set(
+              collectionProducts.map((p) => p.handle || String(p.id)).filter(Boolean)
+            );
+            for (const row of products) {
+              const parentHandle = row.parentExternalId?.replace(/^shopify:/, '');
+              if (!parentHandle || !handleSet.has(parentHandle)) continue;
+
+              // Prefer collection title as category; keep product_type as subcategory when different
+              if (!row.category || row.category === row.subcategory) {
+                if (row.category && row.category !== category && !row.subcategory) {
+                  row.subcategory = row.category;
+                }
+                row.category = category;
+              } else if (!row.subcategory && category !== row.category) {
+                row.subcategory = category;
+              }
+
+              if (categoryDescription && !row.description) {
+                row.description = categoryDescription;
+                row.descriptionSource = row.descriptionSource || 'category';
+              }
+            }
+            enriched += 1;
+          } catch (error) {
+            console.warn(
+              `[scraper] Shopify collection enrich skipped (${collection.handle}): ${error.message}`
+            );
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`[scraper] Shopify collection enrichment skipped: ${error.message}`);
+    }
+  }
+
+  console.log(
+    `[scraper] Shopify: ${products.length} variant-level products from ${origin}`
+  );
+  return products;
+}
+
+async function fetchShopifyCollections(origin, maxPages = 10) {
+  const collections = [];
+  let page = 1;
+  while (page <= maxPages) {
+    const endpoint = `${origin}/collections.json?limit=250&page=${page}`;
+    let data;
+    try {
+      data = await withRetry(`Shopify collections page ${page}`, () => fetchJson(endpoint));
+    } catch (error) {
+      if (page === 1) throw error;
+      break;
+    }
+    const batch = Array.isArray(data?.collections) ? data.collections : [];
+    if (!batch.length) break;
+    collections.push(...batch);
+    if (batch.length < 250) break;
+    page += 1;
+    await sleep(300);
+  }
+  return collections.filter((c) => c.handle && !/^frontpage$/i.test(c.handle));
+}
+
+async function fetchShopifyCollectionProducts(origin, handle, maxPages = 20) {
+  const products = [];
+  let page = 1;
+  while (products.length < MAX_PRODUCTS && page <= maxPages) {
+    const endpoint = `${origin}/collections/${encodeURIComponent(handle)}/products.json?limit=250&page=${page}`;
+    let data;
+    try {
+      data = await withRetry(`Shopify collection ${handle} p${page}`, () =>
+        fetchJson(endpoint)
+      );
+    } catch (error) {
+      if (page === 1) throw error;
+      break;
+    }
+    const batch = Array.isArray(data?.products) ? data.products : [];
+    if (!batch.length) break;
+    products.push(...batch);
+    if (batch.length < 250) break;
+    page += 1;
+    await sleep(250);
+  }
   return products;
 }
 
 /**
- * Scrape WooCommerce via Store API, then REST, then HTML shop pages.
+ * Intelligent WooCommerce crawl:
+ * categories → subcategories → products → variants as independent products.
  */
 export async function scrapeWooCommerce(storeUrl) {
   const origin = originOf(storeUrl);
-  console.log(`[scraper] WooCommerce catalog scrape: ${origin}`);
+  console.log(`[scraper] WooCommerce intelligent crawl: ${origin}`);
+
+  try {
+    const products = await scrapeWooByCategories(origin);
+    if (products.length) {
+      console.log(`[scraper] WooCommerce category crawl: ${products.length} products`);
+      return products;
+    }
+  } catch (error) {
+    console.warn(`[scraper] Woo category crawl failed: ${error.message}`);
+  }
 
   // 1) WooCommerce Store API (often public, no auth)
   try {
@@ -356,11 +548,12 @@ export async function scrapeWooCommerce(storeUrl) {
     `${origin}/shop/`,
     `${origin}/shop`,
     `${origin}/products/`,
-    `${origin}/product-category/disposables/`,
+    `${origin}/product-category/`,
   ];
 
   const seen = new Set();
   const products = [];
+  const descriptionPool = new Map();
 
   for (const path of shopPaths) {
     try {
@@ -371,7 +564,9 @@ export async function scrapeWooCommerce(storeUrl) {
         seen.add(p.externalId);
         products.push(p);
       }
-      if (products.length >= 20) break;
+      // Enrich a sample of product pages for descriptions/images
+      await enrichHtmlProducts(products, descriptionPool, 25);
+      if (products.length >= 30) break;
     } catch (error) {
       console.warn(`[scraper] Woo HTML path failed (${path}): ${error.message}`);
     }
@@ -381,8 +576,175 @@ export async function scrapeWooCommerce(storeUrl) {
   return products;
 }
 
+async function scrapeWooByCategories(origin) {
+  const categories = await fetchWooCategories(origin);
+  if (!categories.length) return [];
+
+  const byId = new Map(categories.map((c) => [c.id, c]));
+  const roots = categories.filter((c) => !c.parent);
+  const childrenOf = (parentId) => categories.filter((c) => c.parent === parentId);
+
+  const products = [];
+  const seen = new Set();
+  const descriptionPool = new Map();
+
+  // Categories with children → CASE 1 (subcategories)
+  // Leaf categories without children → CASE 2 (products directly)
+  const walkTargets = [];
+
+  for (const root of roots.length ? roots : categories) {
+    const kids = childrenOf(root.id);
+    if (kids.length) {
+      for (const kid of kids) {
+        walkTargets.push({
+          category: root.name,
+          subcategory: kid.name,
+          categoryId: kid.id,
+          categoryDescription: cleanDescription(root.description),
+          subcategoryDescription: cleanDescription(kid.description),
+        });
+      }
+    } else {
+      walkTargets.push({
+        category: root.name,
+        subcategory: null,
+        categoryId: root.id,
+        categoryDescription: cleanDescription(root.description),
+        subcategoryDescription: null,
+      });
+    }
+  }
+
+  // Also include orphan subcategories
+  for (const cat of categories) {
+    if (!cat.parent) continue;
+    const parent = byId.get(cat.parent);
+    if (!parent) {
+      walkTargets.push({
+        category: cat.name,
+        subcategory: null,
+        categoryId: cat.id,
+        categoryDescription: cleanDescription(cat.description),
+        subcategoryDescription: null,
+      });
+    }
+  }
+
+  for (const target of walkTargets) {
+    if (products.length >= MAX_PRODUCTS) break;
+    const batch = await fetchWooStoreProductsByCategory(origin, target.categoryId);
+    console.log(
+      `[scraper] Woo "${target.category}"${target.subcategory ? ` → ${target.subcategory}` : ''}: ${batch.length} parent products`
+    );
+
+    for (const item of batch) {
+      if (item.is_purchasable === false && item.is_in_stock === false) continue;
+
+      // Hydrate variations for variable products
+      let hydrated = item;
+      if (item.type === 'variable' || (Array.isArray(item.variations) && item.variations.length)) {
+        try {
+          hydrated = await hydrateWooProduct(origin, item);
+        } catch (error) {
+          console.warn(`[scraper] Woo hydrate ${item.id} failed: ${error.message}`);
+        }
+      }
+
+      const exploded = explodeWooProduct(hydrated, origin, target, descriptionPool);
+      for (const row of exploded) {
+        if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
+        seen.add(row.externalId);
+        products.push(row);
+      }
+    }
+  }
+
+  return products;
+}
+
+async function fetchWooCategories(origin) {
+  const categories = [];
+  let page = 1;
+  while (page <= 20) {
+    const endpoint = `${origin}/wp-json/wc/store/v1/products/categories?per_page=100&page=${page}`;
+    let batch;
+    try {
+      batch = await withRetry(`Woo categories page ${page}`, () => fetchJson(endpoint));
+    } catch (error) {
+      if (page === 1) throw error;
+      break;
+    }
+    if (!Array.isArray(batch) || !batch.length) break;
+    for (const cat of batch) {
+      if (!cat?.id || !cat?.name) continue;
+      if (/uncategorized/i.test(cat.name)) continue;
+      categories.push({
+        id: cat.id,
+        name: cleanText(cat.name),
+        parent: cat.parent || 0,
+        description: cat.description || '',
+        count: cat.count,
+      });
+    }
+    if (batch.length < 100) break;
+    page += 1;
+  }
+  return categories;
+}
+
+async function fetchWooStoreProductsByCategory(origin, categoryId) {
+  const products = [];
+  let page = 1;
+  while (products.length < MAX_PRODUCTS) {
+    const endpoint = `${origin}/wp-json/wc/store/v1/products?per_page=100&page=${page}&category=${categoryId}`;
+    let batch;
+    try {
+      batch = await withRetry(`Woo category ${categoryId} p${page}`, () => fetchJson(endpoint));
+    } catch (error) {
+      if (page === 1) throw error;
+      break;
+    }
+    if (!Array.isArray(batch) || !batch.length) break;
+    products.push(...batch);
+    if (batch.length < 100) break;
+    page += 1;
+  }
+  return products;
+}
+
+async function hydrateWooProduct(origin, item) {
+  try {
+    const detail = await withRetry(`Woo product ${item.id}`, () =>
+      fetchJson(`${origin}/wp-json/wc/store/v1/products/${item.id}`)
+    );
+    if (detail && typeof detail === 'object') {
+      // Fetch variation children when IDs are listed
+      if (Array.isArray(detail.variations) && detail.variations.length && typeof detail.variations[0] === 'number') {
+        const variations = [];
+        for (const variationId of detail.variations.slice(0, 50)) {
+          try {
+            const variation = await fetchJson(
+              `${origin}/wp-json/wc/store/v1/products/${variationId}`
+            );
+            if (variation) variations.push(variation);
+          } catch {
+            // skip missing variation
+          }
+        }
+        detail.variations = variations;
+      }
+      return detail;
+    }
+  } catch {
+    // fall through
+  }
+  return item;
+}
+
 async function scrapeWooStoreApi(origin) {
   const products = [];
+  const seen = new Set();
+  const descriptionPool = new Map();
   let page = 1;
 
   while (products.length < MAX_PRODUCTS) {
@@ -399,20 +761,28 @@ async function scrapeWooStoreApi(origin) {
 
     for (const item of batch) {
       if (item.is_purchasable === false && item.is_in_stock === false) continue;
-      const title = cleanText(item.name || '');
-      if (!title) continue;
-
-      const id = item.id != null ? String(item.id) : title.toLowerCase();
-      const productUrl = item.permalink || `${origin}/?p=${id}`;
-
-      products.push(
-        buildProduct(title, productUrl, {
-          brand: item.brands?.[0]?.name || null,
-          externalId: `woo:${id}`,
-          platform: 'woocommerce',
-          textForSpecs: `${title} ${item.short_description || ''} ${item.description || ''}`,
-        })
+      let hydrated = item;
+      if (item.type === 'variable') {
+        try {
+          hydrated = await hydrateWooProduct(origin, item);
+        } catch {
+          hydrated = item;
+        }
+      }
+      const exploded = explodeWooProduct(
+        hydrated,
+        origin,
+        {
+          category: item.categories?.[0]?.name || null,
+          subcategory: item.categories?.[1]?.name || null,
+        },
+        descriptionPool
       );
+      for (const row of exploded) {
+        if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
+        seen.add(row.externalId);
+        products.push(row);
+      }
     }
 
     if (batch.length < 100) break;
@@ -424,6 +794,8 @@ async function scrapeWooStoreApi(origin) {
 
 async function scrapeWpProducts(origin) {
   const products = [];
+  const seen = new Set();
+  const descriptionPool = new Map();
   let page = 1;
 
   while (products.length < MAX_PRODUCTS) {
@@ -439,17 +811,22 @@ async function scrapeWpProducts(origin) {
     if (!Array.isArray(batch) || !batch.length) break;
 
     for (const item of batch) {
-      const title = cleanText(item.title?.rendered || item.title || '');
-      if (!title) continue;
-      const id = item.id != null ? String(item.id) : title.toLowerCase();
-      const productUrl = item.link || `${origin}/?p=${id}`;
-
-      products.push(
-        buildProduct(title, productUrl, {
-          externalId: `woo:${id}`,
-          platform: 'woocommerce',
-        })
+      const exploded = explodeWooProduct(
+        {
+          id: item.id,
+          name: item.title?.rendered || item.title,
+          link: item.link,
+          description: item.content?.rendered || item.excerpt?.rendered || '',
+        },
+        origin,
+        {},
+        descriptionPool
       );
+      for (const row of exploded) {
+        if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
+        seen.add(row.externalId);
+        products.push(row);
+      }
     }
 
     if (batch.length < 100) break;
@@ -461,6 +838,7 @@ async function scrapeWpProducts(origin) {
 
 /**
  * Generic HTML product extraction (links, headings, JSON-LD).
+ * Variants and rich fields are filled when PDP enrichment runs afterward.
  */
 export function parseProductsFromHtml(html, pageUrl, platform = 'generic') {
   if (!html) return [];
@@ -483,7 +861,7 @@ export function parseProductsFromHtml(html, pageUrl, platform = 'generic') {
     seen.add(externalId);
 
     products.push(
-      buildProduct(title, absoluteUrl, { externalId, platform })
+      buildRichProduct(title, absoluteUrl, { externalId, platform })
     );
   }
 
@@ -497,7 +875,7 @@ export function parseProductsFromHtml(html, pageUrl, platform = 'generic') {
       const externalId = `html:${title.toLowerCase().slice(0, 180)}`;
       if (seen.has(externalId)) continue;
       seen.add(externalId);
-      products.push(buildProduct(title, null, { externalId, platform }));
+      products.push(buildRichProduct(title, null, { externalId, platform }));
     }
   }
 
@@ -514,11 +892,20 @@ export function parseProductsFromHtml(html, pageUrl, platform = 'generic') {
           const externalId = `jsonld:${(item.url || title).toLowerCase().slice(0, 180)}`;
           if (seen.has(externalId)) continue;
           seen.add(externalId);
+
+          let imageUrl = null;
+          if (typeof item.image === 'string') imageUrl = item.image;
+          else if (Array.isArray(item.image)) imageUrl = item.image[0]?.url || item.image[0];
+          else if (item.image?.url) imageUrl = item.image.url;
+
           products.push(
-            buildProduct(title, item.url || null, {
+            buildRichProduct(title, item.url || null, {
               brand: item.brand?.name || item.brand || null,
               externalId,
               platform,
+              description: cleanDescription(item.description || ''),
+              imageUrl,
+              price: item.offers?.price != null ? Number(item.offers.price) : null,
             })
           );
         }
@@ -529,6 +916,45 @@ export function parseProductsFromHtml(html, pageUrl, platform = 'generic') {
   }
 
   return products.slice(0, MAX_PRODUCTS);
+}
+
+/**
+ * Fetch individual product pages to collect descriptions / images (generic HTML path).
+ */
+async function enrichHtmlProducts(products, descriptionPool, limit = 40) {
+  const { resolveSharedDescription } = await import('../utils/descriptionOptimize.js');
+  let enriched = 0;
+  for (const product of products) {
+    if (enriched >= limit) break;
+    if (!product.productUrl || product.description) continue;
+    try {
+      const html = await fetchPageHtml(product.productUrl);
+      const descMatch = html.match(
+        /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i
+      ) || html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
+      const imgMatch = html.match(
+        /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
+      );
+      const bodyMatch = html.match(
+        /<(?:div|section)[^>]*(?:product-description|description|product__description)[^>]*>([\s\S]*?)<\/(?:div|section)>/i
+      );
+      const rawDesc =
+        cleanDescription(bodyMatch?.[1] || '') ||
+        cleanDescription(descMatch?.[1] || '');
+      const desc = resolveSharedDescription(rawDesc, null, null, descriptionPool);
+      if (desc.description) {
+        product.description = desc.description;
+        product.descriptionHash = desc.descriptionHash;
+        product.descriptionSource = desc.descriptionSource;
+      }
+      if (!product.imageUrl && imgMatch?.[1]) {
+        product.imageUrl = imgMatch[1];
+      }
+      enriched += 1;
+    } catch (error) {
+      console.warn(`[scraper] PDP enrich failed (${product.productUrl}): ${error.message}`);
+    }
+  }
 }
 
 function flattenJsonLdProducts(node, acc = []) {
@@ -550,68 +976,9 @@ function flattenJsonLdProducts(node, acc = []) {
   return acc;
 }
 
+/** @deprecated — use buildRichProduct from scraper.catalog.js */
 function buildProduct(title, productUrl, extras = {}) {
-  const textForSpecs = extras.textForSpecs || title;
-  const nicotineMatch = textForSpecs.match(NICOTINE_RE);
-  const volumeMatch = textForSpecs.match(VOLUME_RE);
-  const nicotineMgMl = nicotineMatch ? Number(nicotineMatch[1]) : null;
-  const volumeMl = volumeMatch ? Number(volumeMatch[1]) : null;
-
-  let productType = 'other';
-  if (POD_HINT_RE.test(textForSpecs)) {
-    productType = volumeMl != null && volumeMl <= 2 ? 'pod' : 'prefilled';
-  } else if (BOTTLE_HINT_RE.test(textForSpecs) || (volumeMl != null && volumeMl > 2)) {
-    productType = 'e_liquid';
-  }
-
-  const { brand, flavor } = splitBrandFlavor(title, extras.brand);
-  const platform = extras.platform || 'generic';
-  const externalId =
-    extras.externalId ||
-    `gen:${(productUrl || title).toLowerCase().slice(0, 180)}`;
-
-  return {
-    name: title,
-    brand,
-    flavor,
-    nicotineMgMl: Number.isFinite(nicotineMgMl) ? nicotineMgMl : null,
-    volumeMl: Number.isFinite(volumeMl) ? volumeMl : null,
-    productType,
-    productUrl,
-    externalId,
-    platform,
-  };
-}
-
-function splitBrandFlavor(title, knownBrand = null) {
-  const cleaned = title
-    .replace(NICOTINE_RE, '')
-    .replace(VOLUME_RE, '')
-    .replace(/\b(pod|cartridge|disposable|e-?liquid|e-?juice|salt\s*nic)\b/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-
-  if (knownBrand) {
-    return {
-      brand: String(knownBrand).trim(),
-      flavor:
-        cleaned
-          .replace(new RegExp(`^${escapeRegExp(String(knownBrand))}\\s*[-–:]?\\s*`, 'i'), '')
-          .trim() || cleaned,
-    };
-  }
-
-  const parts = cleaned.split(/\s[-–|]\s/);
-  if (parts.length >= 2) {
-    return { brand: parts[0].trim(), flavor: parts.slice(1).join(' - ').trim() };
-  }
-
-  const words = cleaned.split(/\s+/);
-  if (words.length >= 3) {
-    return { brand: words[0], flavor: words.slice(1).join(' ') };
-  }
-
-  return { brand: null, flavor: cleaned || null };
+  return buildRichProduct(title, productUrl, extras);
 }
 
 function stripTags(html) {
@@ -714,6 +1081,10 @@ export async function scrapeStoreProducts(storeWebsiteUrl) {
     }
   }
 
+  if (htmlProducts.length) {
+    await enrichHtmlProducts(htmlProducts, new Map(), 40);
+  }
+
   const products = dedupeProducts(htmlProducts);
   console.log(`[scraper] Crawl complete: ${products.length} products from ${url} (${platform})`);
 
@@ -727,9 +1098,20 @@ export async function scrapeStoreProducts(storeWebsiteUrl) {
   return products;
 }
 
-/** WooCommerce JSON APIs only (no HTML) — used as a fast probe. */
+/** WooCommerce JSON APIs — prefer category → subcategory crawl, then flat catalog. */
 async function scrapeWooCommerceApisOnly(storeUrl) {
   const origin = originOf(storeUrl);
+
+  // CASE 1 / 2 — intelligent category hierarchy first
+  try {
+    const products = await scrapeWooByCategories(origin);
+    if (products.length) {
+      console.log(`[scraper] WooCommerce category crawl: ${products.length} products`);
+      return products;
+    }
+  } catch (error) {
+    console.warn(`[scraper] Woo category crawl failed: ${error.message}`);
+  }
 
   try {
     const products = await scrapeWooStoreApi(origin);

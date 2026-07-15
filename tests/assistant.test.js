@@ -6,6 +6,8 @@ import Store from '../src/models/Store.js';
 import StoreInventory from '../src/models/StoreInventory.js';
 import { connectTestDB, disconnectTestDB, clearCollections } from './helpers/setup.js';
 import { getLockMessage } from '../src/utils/legalAge.js';
+import { registerPayload } from './helpers/registerPayload.js';
+import { SUBSCRIPTION_STATUS } from '../src/utils/constants.js';
 
 describe('Assistant API', () => {
   let accessToken;
@@ -23,17 +25,20 @@ describe('Assistant API', () => {
   beforeEach(async () => {
     await clearCollections();
 
-    const res = await request(app).post('/api/v1/auth/register').send({
-      firstName: 'Alex',
-      lastName: 'Owner',
-      email: 'alex@store.com',
-      password: 'SecurePass1',
-      storeName: 'Vapor Lounge',
-    });
+    const res = await request(app).post('/api/v1/auth/register').send(
+      registerPayload({
+        firstName: 'Alex',
+        lastName: 'Owner',
+        ownerName: 'Alex Owner',
+        email: 'alex@store.com',
+        storeName: 'Vapor Lounge',
+        websiteUrl: 'https://example.com',
+      })
+    );
 
     accessToken = res.body.data.accessToken;
     storeId = res.body.data.store._id;
-    lockMessage = getLockMessage(19, 'CA', null);
+    lockMessage = getLockMessage(19, 'CA', 'BC');
 
     await StoreInventory.create({
       storeId,
@@ -50,9 +55,15 @@ describe('Assistant API', () => {
 
     await Store.findByIdAndUpdate(storeId, {
       productPageUrl: 'https://example.com/products',
+      websiteUrl: 'https://example.com',
+      allowedHostname: 'example.com',
       assistantEnabled: true,
+      setupCompletedAt: new Date(),
+      subscriptionStatus: SUBSCRIPTION_STATUS.ACTIVE,
       inventorySyncStatus: 'success',
       inventoryProductCount: 1,
+      country: 'CA',
+      province: 'BC',
     });
   });
 

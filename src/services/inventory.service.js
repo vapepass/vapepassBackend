@@ -3,7 +3,33 @@ import StoreInventory from '../models/StoreInventory.js';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/constants.js';
 import { filterRecommendableProducts } from '../utils/compliance.js';
+import {
+  getSubscriptionStatusLabel,
+  hasServiceableSubscription,
+  isStoreSubscriptionActive,
+} from '../utils/subscriptionAccess.js';
 import { scrapeStoreProducts } from './scraper.service.js';
+import { sanitizeProductPageUrl } from './scraper.catalog.js';
+import { buildAndStoreRecommendationTaxonomy } from './taxonomy.service.js';
+
+export const MANUAL_REFRESHES_PER_MONTH = 2;
+
+function currentMonthKey(date = new Date()) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+export function getInventoryRefreshQuota(store) {
+  const monthKey = currentMonthKey();
+  const count =
+    store.inventoryRefreshMonthKey === monthKey ? store.inventoryRefreshCount || 0 : 0;
+  const remaining = Math.max(0, MANUAL_REFRESHES_PER_MONTH - count);
+  return {
+    monthKey,
+    used: count,
+    limit: MANUAL_REFRESHES_PER_MONTH,
+    remaining,
+  };
+}
 
 function getApiPublicBase() {
   const base = (env.apiPublicUrl || `http://localhost:${env.port}`).replace(/\/+$/, '');
@@ -27,8 +53,12 @@ export function buildEmbedCode(storeId) {
  * Sync inventory for a single store from its website URL.
  * Upserts into store_inventories — never creates duplicates.
  * Preserves isPriorityPromotion across syncs.
+ * After sync, GPT rebuilds the dynamic recommendation taxonomy.
+ *
+ * @param {string|import('mongoose').Types.ObjectId} storeId
+ * @param {{ isManualRefresh?: boolean, isInitial?: boolean }} [options]
  */
-export async function syncStoreInventory(storeId) {
+export async function syncStoreInventory(storeId, options = {}) {
   const store = await Store.findById(storeId);
   if (!store) {
     throw new ApiError(404, 'Store not found');
@@ -52,22 +82,41 @@ export async function syncStoreInventory(storeId) {
       const externalId = item.externalId || item.name.toLowerCase();
       seenExternalIds.add(externalId);
 
+      const $set = {
+        name: item.name,
+        brand: item.brand,
+        flavor: item.flavor,
+        description: item.description ?? null,
+        descriptionHash: item.descriptionHash ?? null,
+        descriptionSource: item.descriptionSource ?? null,
+        imageUrl: item.imageUrl ?? null,
+        category: item.category ?? null,
+        subcategory: item.subcategory ?? null,
+        variantName: item.variantName ?? null,
+        parentExternalId: item.parentExternalId ?? null,
+        nicotineMgMl: item.nicotineMgMl,
+        nicotineStrength: item.nicotineStrength ?? null,
+        volumeMl: item.volumeMl,
+        bottleSize: item.bottleSize ?? null,
+        price: item.price ?? null,
+        productType: item.productType,
+        platform: item.platform || 'unknown',
+        isActive: true,
+        status: 'active',
+        lastSeenAt: now,
+      };
+
+      // Never wipe a previously saved storefront URL if this scrape missed it.
+      // Keep productUrl only in $set (never also in $setOnInsert — Mongo conflict).
+      const cleanedUrl = sanitizeProductPageUrl(item.productUrl);
+      if (cleanedUrl) {
+        $set.productUrl = cleanedUrl;
+      }
+
       await StoreInventory.findOneAndUpdate(
         { storeId: store._id, externalId },
         {
-          $set: {
-            name: item.name,
-            brand: item.brand,
-            flavor: item.flavor,
-            nicotineMgMl: item.nicotineMgMl,
-            volumeMl: item.volumeMl,
-            productType: item.productType,
-            productUrl: item.productUrl,
-            platform: item.platform || 'unknown',
-            isActive: true,
-            status: 'active',
-            lastSeenAt: now,
-          },
+          $set,
           $setOnInsert: {
             isPriorityPromotion: false,
           },
@@ -95,19 +144,39 @@ export async function syncStoreInventory(storeId) {
     store.inventorySyncError = null;
     store.lastInventorySyncAt = now;
     store.inventoryProductCount = activeCount;
-    store.assistantEnabled = activeCount > 0;
     store.detectedPlatform = scraped[0]?.platform || store.detectedPlatform || null;
+
+    if (!store.inventoryInitialSyncedAt) {
+      store.inventoryInitialSyncedAt = now;
+    }
+
+    // Chatbot stays off until Finish Setup / Go Live (and subscription is active)
+    if (store.setupCompletedAt && hasServiceableSubscription(store)) {
+      store.assistantEnabled = activeCount > 0;
+    } else if (!store.setupCompletedAt) {
+      store.assistantEnabled = false;
+    }
+
     await store.save();
 
     console.log(
-      `[inventory] Synced ${activeCount} active products for store ${store._id} (no duplicates)`
+      `[inventory] Synced ${activeCount} active products for store ${store._id} (variants expanded, no duplicates)`
     );
+
+    // Rebuild GPT recommendation hierarchy from the latest inventory
+    try {
+      await buildAndStoreRecommendationTaxonomy(store._id);
+    } catch (error) {
+      console.warn(`[inventory] Taxonomy rebuild failed: ${error.message}`);
+    }
 
     return {
       storeId: store._id,
       productCount: activeCount,
       platform: store.detectedPlatform,
       syncedAt: now,
+      isManualRefresh: Boolean(options.isManualRefresh),
+      isInitial: Boolean(options.isInitial),
     };
   } catch (error) {
     console.error(`[inventory] Sync failed for store ${store._id}:`, error.message);
@@ -116,6 +185,90 @@ export async function syncStoreInventory(storeId) {
     await store.save();
     throw error;
   }
+}
+
+/**
+ * First inventory scrape after onboarding (URL + serviceable subscription).
+ * Does not consume the monthly manual refresh quota.
+ */
+export async function maybeRunInitialInventorySync(storeId) {
+  const store = await Store.findById(storeId);
+  if (!store) return null;
+  if (!store.productPageUrl && !store.websiteUrl) return null;
+  if (!hasServiceableSubscription(store)) return null;
+  if (store.inventoryInitialSyncedAt) return null;
+  if (store.inventorySyncStatus === 'syncing' || store.inventorySyncStatus === 'pending') {
+    return null;
+  }
+
+  if (!store.productPageUrl && store.websiteUrl) {
+    store.productPageUrl = store.websiteUrl;
+    await store.save();
+  }
+
+  console.log(`[inventory] Starting initial onboarding scrape for store ${store._id}`);
+  return syncStoreInventory(store._id, { isInitial: true });
+}
+
+/**
+ * Manual Refresh Inventory — limited to 2 per calendar month (UTC) after initial scrape.
+ */
+export async function refreshInventory(user) {
+  if (!user.storeId) {
+    throw new ApiError(404, 'No store associated with this account');
+  }
+
+  const store = await Store.findById(user.storeId);
+  if (!store) {
+    throw new ApiError(404, 'Store not found');
+  }
+
+  if (!store.productPageUrl) {
+    throw new ApiError(400, 'Save your store website URL before refreshing inventory');
+  }
+
+  // First-ever scrape is free (initial)
+  if (!store.inventoryInitialSyncedAt) {
+    store.inventorySyncStatus = 'syncing';
+    store.inventorySyncError = null;
+    await store.save();
+    syncStoreInventory(store._id, { isInitial: true }).catch((error) => {
+      console.error('[inventory] Initial sync failed:', error.message);
+    });
+    return {
+      started: true,
+      isInitial: true,
+      quota: getInventoryRefreshQuota(store),
+      status: await getAssistantStatus(user),
+    };
+  }
+
+  const quota = getInventoryRefreshQuota(store);
+  if (quota.remaining <= 0) {
+    throw new ApiError(
+      429,
+      `Monthly inventory refresh limit reached (${MANUAL_REFRESHES_PER_MONTH}/${MANUAL_REFRESHES_PER_MONTH}). Try again next month.`,
+      { code: 'REFRESH_LIMIT', quota }
+    );
+  }
+
+  const monthKey = currentMonthKey();
+  store.inventoryRefreshMonthKey = monthKey;
+  store.inventoryRefreshCount = quota.used + 1;
+  store.inventorySyncStatus = 'syncing';
+  store.inventorySyncError = null;
+  await store.save();
+
+  syncStoreInventory(store._id, { isManualRefresh: true }).catch((error) => {
+    console.error('[inventory] Manual refresh failed:', error.message);
+  });
+
+  return {
+    started: true,
+    isInitial: false,
+    quota: getInventoryRefreshQuota(await Store.findById(store._id)),
+    status: await getAssistantStatus(user),
+  };
 }
 
 /**
@@ -226,7 +379,9 @@ export async function setProductPageUrl(user, productPageUrl, { syncNow = true }
   await store.save();
 
   if (syncNow) {
-    syncStoreInventory(store._id).catch((error) => {
+    // Initial or URL-change sync — does not consume refresh quota when first-time
+    const isInitial = !store.inventoryInitialSyncedAt;
+    syncStoreInventory(store._id, { isInitial }).catch((error) => {
       console.error('[inventory] Immediate sync after URL save failed:', error.message);
     });
   }
@@ -274,19 +429,80 @@ export async function getAssistantStatus(user) {
   const recommendable = filterRecommendableProducts(active);
   const priorityCount = active.filter((p) => p.isPriorityPromotion).length;
 
+  const subscriptionActive = hasServiceableSubscription(store);
+  const isLive = Boolean(
+    store.setupCompletedAt && store.assistantEnabled && recommendable.length > 0 && subscriptionActive
+  );
+  const refreshQuota = getInventoryRefreshQuota(store);
+
   return {
     storeId: store._id,
     storeName: store.name,
     productPageUrl: store.productPageUrl,
+    websiteUrl: store.websiteUrl || store.productPageUrl,
+    allowedHostname: store.allowedHostname || null,
     detectedPlatform: store.detectedPlatform || null,
-    assistantEnabled: Boolean(store.assistantEnabled && recommendable.length > 0),
+    assistantEnabled: Boolean(store.assistantEnabled && recommendable.length > 0 && subscriptionActive),
+    setupCompletedAt: store.setupCompletedAt,
+    isLive,
+    canGoLive: Boolean(
+      subscriptionActive && recommendable.length > 0 && store.productPageUrl
+    ),
+    paymentFailed: store.subscriptionStatus === 'past_due',
+    subscriptionStatus: store.subscriptionStatus,
+    subscriptionStatusLabel: getSubscriptionStatusLabel(store.subscriptionStatus),
+    subscriptionFullyActive: isStoreSubscriptionActive(store),
     inventorySyncStatus: store.inventorySyncStatus,
     inventorySyncError: store.inventorySyncError,
     lastInventorySyncAt: store.lastInventorySyncAt,
+    inventoryInitialSyncedAt: store.inventoryInitialSyncedAt,
     inventoryProductCount: store.inventoryProductCount,
     recommendableProductCount: recommendable.length,
     priorityPromotionCount: priorityCount,
+    inventoryRefresh: {
+      remaining: refreshQuota.remaining,
+      used: refreshQuota.used,
+      limit: refreshQuota.limit,
+      label: `Inventory Refreshes Remaining: ${refreshQuota.remaining} / Month`,
+    },
+    recommendationTaxonomyStatus: store.recommendationTaxonomyStatus || 'idle',
+    recommendationTaxonomyBuiltAt: store.recommendationTaxonomyBuiltAt,
     embedCode: buildEmbedCode(store._id),
     widgetScriptUrl: buildWidgetScriptUrl(),
   };
+}
+
+/**
+ * Finish Setup / Go Live — unlocks the public chatbot for an authorized, subscribed store.
+ */
+export async function goLive(user) {
+  if (!user.storeId) {
+    throw new ApiError(404, 'No store associated with this account');
+  }
+
+  const store = await Store.findById(user.storeId);
+  if (!store) {
+    throw new ApiError(404, 'Store not found');
+  }
+
+  if (!hasServiceableSubscription(store)) {
+    throw new ApiError(402, 'An active subscription is required before going live');
+  }
+
+  if (!store.productPageUrl && !store.websiteUrl) {
+    throw new ApiError(400, 'Website URL is required before going live');
+  }
+
+  const products = await getStoreInventory(store._id, { activeOnly: true });
+  const recommendable = filterRecommendableProducts(products);
+
+  if (!recommendable.length) {
+    throw new ApiError(400, 'Sync and push at least one recommendable product before going live');
+  }
+
+  store.setupCompletedAt = new Date();
+  store.assistantEnabled = true;
+  await store.save();
+
+  return getAssistantStatus(user);
 }

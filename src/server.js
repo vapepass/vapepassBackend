@@ -2,6 +2,7 @@ import app from './app.js';
 import { connectDB } from './config/db.js';
 import { env } from './config/env.js';
 import { startInventoryCron } from './jobs/inventoryCron.js';
+import { startSubscriptionCron } from './jobs/subscriptionCron.js';
 
 const MAX_DB_RETRIES = 5;
 const DB_RETRY_DELAY_MS = 5000;
@@ -34,6 +35,7 @@ const startServer = async () => {
 
   await connectWithRetry();
   startInventoryCron();
+  startSubscriptionCron();
 };
 
 startServer().catch((error) => {

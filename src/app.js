@@ -62,6 +62,9 @@ app.get('/widget.js', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/widget.js'));
 });
 
+// Static assets (email logo, etc.)
+app.use(express.static(path.join(__dirname, '../public'), { maxAge: '1d' }));
+
 // API v1 routes
 app.use('/api/v1', apiRoutes);
 

@@ -26,7 +26,9 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
     'rewardDescription',
     'stampGoal',
     'productPageUrl',
+    'websiteUrl',
     'address',
+    'city',
     'country',
     'province',
   ];
@@ -38,17 +40,33 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
     }
   }
 
-  if (data.productPageUrl) {
-    let url = String(data.productPageUrl).trim();
-    if (url && !/^https?:\/\//i.test(url)) {
+  const normalizeUrl = (raw, label) => {
+    let url = String(raw).trim();
+    if (!url) return null;
+    if (!/^https?:\/\//i.test(url)) {
       url = `https://${url}`;
     }
     try {
-      data.productPageUrl = new URL(url).toString();
-      data.inventorySyncStatus = 'pending';
+      return new URL(url).toString();
     } catch {
-      throw new ApiError(400, 'Invalid product page URL');
+      throw new ApiError(400, `Invalid ${label}`);
     }
+  };
+
+  if (data.websiteUrl) {
+    data.websiteUrl = normalizeUrl(data.websiteUrl, 'website URL');
+    if (!data.productPageUrl) {
+      data.productPageUrl = data.websiteUrl;
+    }
+    data.inventorySyncStatus = 'pending';
+  }
+
+  if (data.productPageUrl) {
+    data.productPageUrl = normalizeUrl(data.productPageUrl, 'website URL');
+    if (!data.websiteUrl) {
+      data.websiteUrl = data.productPageUrl;
+    }
+    data.inventorySyncStatus = 'pending';
   }
 
   if (logoFile) {
@@ -57,7 +75,8 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
   }
 
   const productUrlChanged =
-    data.productPageUrl && data.productPageUrl !== store.productPageUrl;
+    (data.productPageUrl && data.productPageUrl !== store.productPageUrl) ||
+    (data.websiteUrl && data.websiteUrl !== store.websiteUrl);
 
   Object.assign(store, data);
 

@@ -3,17 +3,25 @@ import assert from 'node:assert/strict';
 import request from 'supertest';
 import app from '../src/app.js';
 import Customer from '../src/models/Customer.js';
+import Store from '../src/models/Store.js';
 import VerificationCode from '../src/models/VerificationCode.js';
+import { SUBSCRIPTION_STATUS } from '../src/utils/constants.js';
 import { connectTestDB, disconnectTestDB, clearCollections } from './helpers/setup.js';
+import { registerPayload } from './helpers/registerPayload.js';
 
 async function registerOwner(email, storeName) {
-  const res = await request(app).post('/api/v1/auth/register').send({
-    firstName: 'Owner',
-    lastName: 'Test',
-    email,
-    password: 'SecurePass1',
-    storeName,
+  const res = await request(app).post('/api/v1/auth/register').send(
+    registerPayload({
+      email,
+      storeName,
+      websiteUrl: `https://${storeName.toLowerCase().replace(/\s+/g, '-')}.example.com`,
+    })
+  );
+
+  await Store.findByIdAndUpdate(res.body.data.store._id, {
+    subscriptionStatus: SUBSCRIPTION_STATUS.ACTIVE,
   });
+
   return res.body.data;
 }
 

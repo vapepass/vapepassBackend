@@ -5,6 +5,7 @@ import { env } from '../config/env.js';
 import { ApiError } from '../utils/constants.js';
 import {
   buildSystemPrompt,
+  detectsRecommendationRestart,
   detectsUnderage,
   formatInventoryForPrompt,
   getComplianceMessages,
@@ -13,46 +14,76 @@ import {
   buildInventoryFallbackReply,
 } from '../utils/compliance.js';
 import { getAgeYesLabel, resolveStoreLegalAge } from '../utils/legalAge.js';
+import { canServeChatbot } from '../utils/subscriptionAccess.js';
 import { getRecommendableInventory } from './inventory.service.js';
+import {
+  advanceFunnel,
+  beginFunnel,
+  ensureStoreTaxonomy,
+  resetFunnel,
+  serializeProductCard,
+} from './recommendationFunnel.service.js';
 
 const MAX_HISTORY_MESSAGES = 20;
 
 /**
  * Public widget bootstrap config for a store.
  */
-export async function getWidgetConfig(storeId) {
-  const store = await Store.findById(storeId).select(
-    'name brandColor assistantEnabled productPageUrl country province legalAge'
-  );
+export async function getWidgetConfig(storeId, options = {}) {
+  const store =
+    options.store ||
+    (await Store.findById(storeId).select(
+      'name brandColor assistantEnabled productPageUrl websiteUrl country province legalAge subscriptionStatus setupCompletedAt inventorySyncStatus'
+    ));
   if (!store) {
     throw new ApiError(404, 'Store not found');
   }
 
   const inventory = await getRecommendableInventory(store._id);
   const compliance = getComplianceMessages(store);
+  const domainDenied = Boolean(options.domainDenied);
+  const demoMode = Boolean(options.demoMode);
+  const serveOk = canServeChatbot(store, { demoMode });
+  const enabled = !domainDenied && serveOk && inventory.length > 0;
 
   return {
     storeId: store._id,
     storeName: store.name,
     brandColor: store.brandColor,
     legalAge: compliance.legalAge,
+    regionLabel: compliance.regionLabel,
+    minimumAgeLabel: `Minimum Age: ${compliance.legalAge}+`,
     healthWarning: compliance.healthWarning,
     ageQuestion: compliance.ageQuestion,
     ageYesLabel: getAgeYesLabel(compliance.legalAge),
     lockMessage: compliance.lockMessage,
+    poweredBy: 'Powered by VapePass',
     requireSiteAgeGate: true,
-    enabled: Boolean(store.assistantEnabled && store.productPageUrl && inventory.length > 0),
+    guidedFunnel: true,
+    enabled,
+    disabledReason: domainDenied
+      ? 'unauthorized_domain'
+      : !serveOk
+        ? 'subscription_or_setup'
+        : inventory.length === 0
+          ? 'no_inventory'
+          : null,
     productCount: inventory.length,
+    syncing: store.inventorySyncStatus === 'syncing' || store.inventorySyncStatus === 'pending',
   };
 }
 
 /**
  * Start or resume a chat session. Returns the opening age-verification prompt when new.
  */
-export async function startSession(storeId, sessionKey) {
+export async function startSession(storeId, sessionKey, options = {}) {
   const store = await Store.findById(storeId);
   if (!store) {
     throw new ApiError(404, 'Store not found');
+  }
+
+  if (!canServeChatbot(store, { demoMode: options.demoMode })) {
+    throw new ApiError(402, 'Chatbot is unavailable for this store');
   }
 
   const compliance = getComplianceMessages(store);
@@ -67,6 +98,12 @@ export async function startSession(storeId, sessionKey) {
       storeId,
       ageVerified: false,
       locked: false,
+      funnelState: {
+        phase: 'age',
+        currentStepId: null,
+        candidateProductIds: [],
+        path: [],
+      },
       messages: [
         {
           role: 'assistant',
@@ -81,9 +118,9 @@ export async function startSession(storeId, sessionKey) {
 }
 
 /**
- * Process a customer message with full compliance + inventory-only enforcement.
+ * Process a customer message with compliance + dynamic GPT funnel.
  */
-export async function sendMessage(storeId, sessionKey, message) {
+export async function sendMessage(storeId, sessionKey, message, options = {}) {
   const content = String(message || '').trim();
   if (!content) {
     throw new ApiError(400, 'Message is required');
@@ -92,9 +129,13 @@ export async function sendMessage(storeId, sessionKey, message) {
     throw new ApiError(400, 'Message is too long');
   }
 
-  const store = await Store.findById(storeId);
+  let store = await Store.findById(storeId);
   if (!store) {
     throw new ApiError(404, 'Store not found');
+  }
+
+  if (!canServeChatbot(store, { demoMode: options.demoMode })) {
+    throw new ApiError(402, 'Chatbot is unavailable for this store');
   }
 
   const compliance = getComplianceMessages(store);
@@ -107,26 +148,49 @@ export async function sendMessage(storeId, sessionKey, message) {
       storeId,
       ageVerified: false,
       locked: false,
+      funnelState: {
+        phase: 'age',
+        currentStepId: null,
+        candidateProductIds: [],
+        path: [],
+      },
       messages: [{ role: 'assistant', content: ageQuestion }],
       lastMessageAt: new Date(),
     });
   }
 
-  // Permanently locked sessions cannot continue
   if (session.locked) {
     return {
       ...serializeSession(session, store, compliance),
       reply: lockMessage,
+      replyType: 'locked',
+      options: [],
+      products: [],
       locked: true,
     };
   }
 
-  // Hardcoded underage tripwire — runs before any model call
   if (detectsUnderage(content, legalAge)) {
     return lockSession(session, store, compliance, content, 'underage_tripwire');
   }
 
-  // Chatbot age verification gate (step 2 of double age verification)
+  // Restart recommendation funnel
+  if (session.ageVerified && detectsRecommendationRestart(content)) {
+    store = (await ensureStoreTaxonomy(store._id)) || store;
+    session.messages.push({ role: 'user', content });
+    const started = await resetFunnel(store, session);
+    session.messages.push({ role: 'assistant', content: started.reply });
+    session.lastMessageAt = new Date();
+    await session.save();
+    return {
+      ...serializeSession(session, store, compliance),
+      ...started,
+      locked: false,
+      recommendationRestart: true,
+    };
+  }
+
+  // Age verification gate
   if (!session.ageVerified) {
     const ageReply = interpretAgeReply(content, legalAge);
     session.messages.push({ role: 'user', content });
@@ -143,27 +207,29 @@ export async function sendMessage(storeId, sessionKey, message) {
       return {
         ...serializeSession(session, store, compliance),
         reply,
+        replyType: 'age',
+        options: [],
+        products: [],
         locked: false,
       };
     }
 
     session.ageVerified = true;
-    const welcome =
-      "Thanks for confirming. Tell me what you usually get or what you're looking for, and I'll recommend options from our current inventory only.";
-    session.messages.push({ role: 'assistant', content: welcome });
+    store = (await ensureStoreTaxonomy(store._id)) || store;
+    const started = await beginFunnel(store, session);
+    session.messages.push({ role: 'assistant', content: started.reply });
     session.lastMessageAt = new Date();
     await session.save();
 
     return {
       ...serializeSession(session, store, compliance),
-      reply: welcome,
+      ...started,
       locked: false,
     };
   }
 
   session.messages.push({ role: 'user', content });
 
-  // Always load recommendations dynamically from this retailer's MongoDB inventory
   const inventory = await getRecommendableInventory(store._id);
   if (!inventory.length) {
     const reply =
@@ -174,29 +240,82 @@ export async function sendMessage(storeId, sessionKey, message) {
     return {
       ...serializeSession(session, store, compliance),
       reply,
+      replyType: 'text',
+      options: [],
+      products: [],
       locked: false,
     };
   }
 
+  store = (await ensureStoreTaxonomy(store._id)) || store;
+
+  const phase = session.funnelState?.phase || 'funnel';
+  let guided = null;
+
+  if (phase === 'funnel' || phase === 'recommendation') {
+    guided = await advanceFunnel(store, session, content, inventory);
+  }
+
+  if (guided) {
+    session.messages.push({ role: 'assistant', content: guided.reply });
+    session.lastMessageAt = new Date();
+    await session.save();
+    return {
+      ...serializeSession(session, store, compliance),
+      ...guided,
+      locked: false,
+    };
+  }
+
+  // Free-form chat fallback (taxonomy missing or free_chat phase)
   let reply = await generateAssistantReply(store, session, inventory, content);
 
-  // Secondary compliance check on model output for underage lock phrasing
   if (reply.includes('This conversation has ended')) {
     session.locked = true;
     session.lockReason = 'model_underage_detection';
     reply = lockMessage;
   } else {
-    // Enforce inventory-only: never allow hallucinated product names through
     reply = enforceInventoryOnlyReply(reply, inventory, content);
   }
 
+  session.funnelState = {
+    ...(session.funnelState || {}),
+    phase: session.locked ? 'age' : 'free_chat',
+  };
   session.messages.push({ role: 'assistant', content: reply });
   session.lastMessageAt = new Date();
   await session.save();
 
+  // Extend response with storefront product URLs for View Product CTA (no cart / checkout)
+  let replyType = session.locked ? 'locked' : 'text';
+  let products = [];
+  if (!session.locked) {
+    const mentioned = inventory.filter((p) => isProductReferencedInReply(p, reply));
+    const looksLikeRecommendation =
+      /\b(try|recommend|like|suggest|option|available|inventory|flavor|might|enjoy|check out)\b/i.test(
+        reply
+      );
+    if (looksLikeRecommendation && mentioned.length) {
+      replyType = 'recommendation';
+      products = mentioned.slice(0, 1).map(serializeProductCard).filter(Boolean);
+    }
+  }
+
   return {
     ...serializeSession(session, store, compliance),
     reply,
+    replyType,
+    options: session.locked
+      ? []
+      : [
+          {
+            id: 'another',
+            label: 'Get Another Recommendation',
+            emoji: '✨',
+            value: 'Get Another Recommendation',
+          },
+        ],
+    products,
     locked: session.locked,
   };
 }
@@ -216,6 +335,9 @@ async function lockSession(session, store, compliance, userContent, reason) {
   return {
     ...serializeSession(session, store, compliance),
     reply: lockMessage,
+    replyType: 'locked',
+    options: [],
+    products: [],
     locked: true,
   };
 }
@@ -244,7 +366,7 @@ async function generateAssistantReply(store, session, inventory, userMessage) {
       body: JSON.stringify({
         model: env.openai.model,
         temperature: 0.2,
-        max_tokens: 220,
+        max_tokens: 320,
         messages: [{ role: 'system', content: systemPrompt }, ...history],
       }),
     });
@@ -266,9 +388,6 @@ async function generateAssistantReply(store, session, inventory, userMessage) {
   }
 }
 
-/**
- * If the model mentions products not in inventory, replace with a keyword-matched fallback.
- */
 function enforceInventoryOnlyReply(reply, inventory, userMessage) {
   if (!reply || !inventory?.length) {
     return buildInventoryFallbackReply(inventory, userMessage);
@@ -295,21 +414,26 @@ function enforceResponseLength(text) {
   return sentences.slice(0, 3).join(' ').trim();
 }
 
-function serializeSession(session, store, compliance) {
+function serializeSession(session, store, compliance, extras = {}) {
   return {
     sessionKey: session.sessionKey,
     storeId: store._id,
     storeName: store.name,
     legalAge: compliance.legalAge,
+    regionLabel: compliance.regionLabel,
+    minimumAgeLabel: `Minimum Age: ${compliance.legalAge}+`,
     ageVerified: session.ageVerified,
     locked: session.locked,
     healthWarning: compliance.healthWarning,
     ageQuestion: compliance.ageQuestion,
     ageYesLabel: getAgeYesLabel(compliance.legalAge),
     lockMessage: compliance.lockMessage,
+    poweredBy: 'Powered by VapePass',
+    funnelState: session.funnelState || null,
     messages: session.messages.map((m) => ({
       role: m.role,
       content: m.content,
     })),
+    ...extras,
   };
 }

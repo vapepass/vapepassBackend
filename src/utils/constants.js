@@ -20,6 +20,12 @@ export const SUBSCRIPTION_STATUS = {
   PAST_DUE: 'past_due',
   CANCELLED: 'cancelled',
   PAUSED: 'paused',
+  EXPIRED: 'expired',
+};
+
+/** Default SaaS plan identifier */
+export const SUBSCRIPTION_PLANS = {
+  PRO: 'pro',
 };
 
 export const ACTIVITY_TYPES = {

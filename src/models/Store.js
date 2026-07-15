@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
-import { SUBSCRIPTION_STATUS } from '../utils/constants.js';
+import { SUBSCRIPTION_PLANS, SUBSCRIPTION_STATUS } from '../utils/constants.js';
+import { extractHostname } from '../utils/domain.js';
 import { getLegalAge } from '../utils/legalAge.js';
 
 const storeSchema = new mongoose.Schema(
@@ -35,6 +36,36 @@ const storeSchema = new mongoose.Schema(
       enum: Object.values(SUBSCRIPTION_STATUS),
       default: SUBSCRIPTION_STATUS.TRIAL,
     },
+    subscriptionPlan: {
+      type: String,
+      enum: Object.values(SUBSCRIPTION_PLANS),
+      default: SUBSCRIPTION_PLANS.PRO,
+    },
+    subscriptionStartDate: {
+      type: Date,
+      default: null,
+    },
+    subscriptionEndDate: {
+      type: Date,
+      default: null,
+    },
+    nextBillingDate: {
+      type: Date,
+      default: null,
+    },
+    paymentRetryCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    renewalReminderSentAt: {
+      type: Date,
+      default: null,
+    },
+    lastPaymentFailedAt: {
+      type: Date,
+      default: null,
+    },
     passKitProgramId: {
       type: String,
       default: null,
@@ -56,7 +87,22 @@ const storeSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
-    /** Product listing page URL used for daily inventory sync */
+    /** Authorized store website URL — embed script only works on this domain */
+    websiteUrl: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: [2048, 'Website URL cannot exceed 2048 characters'],
+    },
+    /** Normalized hostname derived from websiteUrl / productPageUrl for embed checks */
+    allowedHostname: {
+      type: String,
+      default: null,
+      trim: true,
+      lowercase: true,
+      maxlength: [253, 'Hostname cannot exceed 253 characters'],
+    },
+    /** Product listing page URL used for daily inventory sync (defaults to websiteUrl) */
     productPageUrl: {
       type: String,
       default: null,
@@ -66,6 +112,11 @@ const storeSchema = new mongoose.Schema(
     assistantEnabled: {
       type: Boolean,
       default: false,
+    },
+    /** Set when store owner clicks Finish Setup / Go Live */
+    setupCompletedAt: {
+      type: Date,
+      default: null,
     },
     inventorySyncStatus: {
       type: String,
@@ -91,10 +142,52 @@ const storeSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    /** First automatic inventory scrape completed after onboarding */
+    inventoryInitialSyncedAt: {
+      type: Date,
+      default: null,
+    },
+    /**
+     * Manual Refresh Inventory quota — resets each calendar month (UTC).
+     * Owners get 2 refreshes / month after the initial scrape.
+     */
+    inventoryRefreshMonthKey: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: 7,
+    },
+    inventoryRefreshCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     detectedPlatform: {
       type: String,
       enum: ['shopify', 'woocommerce', 'generic', 'unknown'],
       default: undefined,
+    },
+    /**
+     * GPT-built dynamic recommendation hierarchy for the chatbot funnel.
+     * Shape: { entryStepId, steps: { [id]: { id, prompt, options[] } } }
+     */
+    recommendationTaxonomy: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    recommendationTaxonomyStatus: {
+      type: String,
+      enum: ['idle', 'pending', 'building', 'ready', 'error'],
+      default: 'idle',
+    },
+    recommendationTaxonomyError: {
+      type: String,
+      default: null,
+      maxlength: 1000,
+    },
+    recommendationTaxonomyBuiltAt: {
+      type: Date,
+      default: null,
     },
     /** Street address for the store (used for location-based compliance) */
     address: {
@@ -102,6 +195,12 @@ const storeSchema = new mongoose.Schema(
       default: null,
       trim: true,
       maxlength: [500, 'Address cannot exceed 500 characters'],
+    },
+    city: {
+      type: String,
+      default: null,
+      trim: true,
+      maxlength: [120, 'City cannot exceed 120 characters'],
     },
     /** ISO-style country code or full name (e.g. CA, US, Canada, United States) */
     country: {
@@ -130,7 +229,7 @@ const storeSchema = new mongoose.Schema(
   }
 );
 
-/** Recalculate legalAge whenever location fields change */
+/** Keep legalAge + allowedHostname in sync when related fields change */
 storeSchema.pre('save', function (next) {
   if (
     this.isNew ||
@@ -140,6 +239,25 @@ storeSchema.pre('save', function (next) {
   ) {
     this.legalAge = getLegalAge(this.country, this.province);
   }
+
+  if (
+    this.isNew ||
+    this.isModified('websiteUrl') ||
+    this.isModified('productPageUrl') ||
+    this.isModified('allowedHostname')
+  ) {
+    const sourceUrl = this.websiteUrl || this.productPageUrl;
+    if (sourceUrl) {
+      this.allowedHostname = extractHostname(sourceUrl);
+      if (!this.websiteUrl && this.productPageUrl) {
+        this.websiteUrl = this.productPageUrl;
+      }
+      if (!this.productPageUrl && this.websiteUrl) {
+        this.productPageUrl = this.websiteUrl;
+      }
+    }
+  }
+
   next();
 });
 

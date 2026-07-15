@@ -40,6 +40,7 @@ export const env = {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
     from: process.env.EMAIL_FROM,
+    logoUrl: process.env.EMAIL_LOGO_URL,
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY,

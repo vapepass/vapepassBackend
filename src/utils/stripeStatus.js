@@ -13,11 +13,15 @@ export function mapStripeSubscriptionStatus(stripeStatus) {
   }
 
   if (stripeStatus === 'canceled' || stripeStatus === 'cancelled') {
-    return SUBSCRIPTION_STATUS.CANCELLED;
+    return SUBSCRIPTION_STATUS.EXPIRED;
   }
 
   if (stripeStatus === 'paused') {
     return SUBSCRIPTION_STATUS.PAUSED;
+  }
+
+  if (stripeStatus === 'incomplete_expired') {
+    return SUBSCRIPTION_STATUS.EXPIRED;
   }
 
   return null;

@@ -49,4 +49,15 @@ router.post('/checkout', billingController.createCheckout);
  */
 router.post('/portal', billingController.createPortal);
 
+/**
+ * @swagger
+ * /billing/confirm:
+ *   post:
+ *     summary: Confirm Stripe Checkout and activate subscription (webhook fallback)
+ *     tags: [Billing]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post('/confirm', billingController.confirmCheckout);
+
 export default router;

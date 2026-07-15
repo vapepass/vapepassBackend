@@ -46,6 +46,34 @@ const chatSessionSchema = new mongoose.Schema(
       type: [messageSchema],
       default: [],
     },
+    /**
+     * Dynamic GPT funnel state — depth and options come from store taxonomy,
+     * not hardcoded frontend steps.
+     */
+    funnelState: {
+      type: {
+        phase: {
+          type: String,
+          enum: ['age', 'funnel', 'recommendation', 'free_chat'],
+          default: 'age',
+        },
+        currentStepId: { type: String, default: null },
+        candidateProductIds: [{ type: String }],
+        path: [
+          {
+            stepId: String,
+            optionId: String,
+            label: String,
+          },
+        ],
+      },
+      default: () => ({
+        phase: 'age',
+        currentStepId: null,
+        candidateProductIds: [],
+        path: [],
+      }),
+    },
     lastMessageAt: {
       type: Date,
       default: Date.now,

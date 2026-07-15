@@ -46,6 +46,8 @@
     open: false,
     minimized: false,
     sending: false,
+    booting: true,
+    showRestart: false,
   };
 
   /**
@@ -182,6 +184,49 @@
     '.vp-header-icon svg { width: 17px; height: 17px; stroke: #fff; fill: none; stroke-width: 2; }',
     '.vp-header h2 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; }',
     '.vp-header p { margin: 2px 0 0; font-size: 12px; color: #DDD6FE; line-height: 1.25; }',
+    '.vp-header-meta { margin: 4px 0 0; font-size: 11px; color: rgba(255,255,255,0.88); line-height: 1.35; }',
+    '.vp-loading {',
+    '  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;',
+    '  gap: 14px; padding: 28px 24px; text-align: center; background: #fff;',
+    '}',
+    '.vp-loading h3 { margin: 0; font-size: 15px; font-weight: 700; color: #111827; }',
+    '.vp-loading p { margin: 0; font-size: 13px; color: #6B7280; line-height: 1.5; }',
+    '.vp-progress {',
+    '  width: min(220px, 80%); height: 6px; border-radius: 9999px; background: #E5E7EB; overflow: hidden;',
+    '}',
+    '.vp-progress > span {',
+    '  display: block; height: 100%; width: 30%; border-radius: 9999px; background: #8B5CF6;',
+    '  animation: vp-progress 1.4s ease-in-out infinite;',
+    '}',
+    '@keyframes vp-progress {',
+    '  0% { transform: translateX(-120%); }',
+    '  100% { transform: translateX(320%); }',
+    '}',
+    '.vp-restart {',
+    '  padding: 0 16px 12px; background: #fff; flex-shrink: 0;',
+    '}',
+    '.vp-restart button {',
+    '  width: 100%; height: 40px; border: 1px solid #E5E7EB; border-radius: 9999px;',
+    '  background: #F9FAFB; color: #374151; font-size: 13px; font-weight: 600; cursor: pointer;',
+    '}',
+    '.vp-restart button:hover { background: #F3F4F6; }',
+    '.vp-options { padding: 4px 16px 12px; display: flex; flex-wrap: wrap; gap: 8px; background: #fff; flex-shrink: 0; }',
+    '.vp-option-chip { border: 1px solid #E5E7EB; background: #F9FAFB; color: #374151; border-radius: 999px; padding: 8px 12px; font-size: 12px; font-weight: 600; cursor: pointer; }',
+    '.vp-option-chip:hover { background: #F3F4F6; }',
+    '.vp-option-chip:disabled { opacity: .5; cursor: not-allowed; }',
+    '.vp-product-card {',
+    '  margin: 4px 0 10px; padding: 12px; border: 1px solid #E5E7EB; border-radius: 16px;',
+    '  background: linear-gradient(180deg, #fff, #faf9ff); max-width: 92%;',
+    '}',
+    '.vp-product-card h4 { margin: 0; font-size: 14px; font-weight: 650; color: #111827; }',
+    '.vp-product-card p { margin: 6px 0 0; font-size: 12px; color: #4B5563; line-height: 1.45; }',
+    '.vp-view-product {',
+    '  display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 10px;',
+    '  height: 38px; border-radius: 9999px; background: #8B5CF6; color: #fff; text-decoration: none;',
+    '  font-size: 13px; font-weight: 600; transition: background .15s ease, transform .15s ease;',
+    '}',
+    '.vp-view-product:hover { background: #7C3AED; transform: translateY(-1px); }',
+    '.vp-view-product:active { transform: translateY(0); }',
     '.vp-header-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }',
     '.vp-icon-btn {',
     '  background: transparent; border: none; color: rgba(255,255,255,.9);',
@@ -291,7 +336,11 @@
     '      </div>',
     '      <div>',
     '        <h2>AI Flavor Sommelier</h2>',
-    '        <p>Powered by VapePass</p>',
+    '        <p class="vp-powered">Powered by VapePass</p>',
+    '        <div class="vp-header-meta">',
+    '          <div class="vp-region"></div>',
+    '          <div class="vp-min-age"></div>',
+    '        </div>',
     '      </div>',
     '    </div>',
     '    <div class="vp-header-actions">',
@@ -307,10 +356,19 @@
     '    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>',
     '    <span class="vp-warning-text"></span>',
     '  </div>',
-    '  <div class="vp-messages" role="log" aria-live="polite" aria-relevant="additions"></div>',
+    '  <div class="vp-loading">',
+    '    <h3 class="vp-loading-title">Syncing Inventory...</h3>',
+    '    <p class="vp-loading-copy">Please wait...</p>',
+    '    <div class="vp-progress" aria-hidden="true"><span></span></div>',
+    '  </div>',
+    '  <div class="vp-messages vp-hidden" role="log" aria-live="polite" aria-relevant="additions"></div>',
     '  <div class="vp-age-actions vp-hidden">',
     '    <button type="button" class="vp-age-yes"></button>',
     '    <button type="button" class="vp-age-no">No</button>',
+    '  </div>',
+    '  <div class="vp-options vp-hidden"></div>',
+    '  <div class="vp-restart vp-hidden">',
+    '    <button type="button" class="vp-restart-btn">Get Another Recommendation</button>',
     '  </div>',
     '  <div class="vp-composer-wrap vp-hidden">',
     '    <div class="vp-status"></div>',
@@ -341,11 +399,70 @@
   var statusEl = root.querySelector('.vp-status');
   var ageActionsEl = root.querySelector('.vp-age-actions');
   var composerWrapEl = root.querySelector('.vp-composer-wrap');
+  var loadingEl = root.querySelector('.vp-loading');
+  var loadingTitleEl = root.querySelector('.vp-loading-title');
+  var loadingCopyEl = root.querySelector('.vp-loading-copy');
+  var regionEl = root.querySelector('.vp-region');
+  var minAgeEl = root.querySelector('.vp-min-age');
+  var restartEl = root.querySelector('.vp-restart');
+  var restartBtn = root.querySelector('.vp-restart-btn');
+  var optionsEl = root.querySelector('.vp-options');
   var ageYesBtn = root.querySelector('.vp-age-yes');
   var ageNoBtn = root.querySelector('.vp-age-no');
   var form = root.querySelector('.vp-composer');
   var input = form.querySelector('input');
   var sendBtn = form.querySelector('button');
+
+  state.currentOptions = [];
+  state.replyType = null;
+  state.recommendedProducts = [];
+
+  function sleep(ms) {
+    return new Promise(function (resolve) {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  function setLoadingStep(title, copy) {
+    if (loadingTitleEl) loadingTitleEl.textContent = title;
+    if (loadingCopyEl) loadingCopyEl.textContent = copy;
+  }
+
+  function setBooting(booting) {
+    state.booting = booting;
+    if (loadingEl) loadingEl.classList.toggle('vp-hidden', !booting);
+    messagesEl.classList.toggle('vp-hidden', booting);
+    if (booting) {
+      ageActionsEl.classList.add('vp-hidden');
+      composerWrapEl.classList.add('vp-hidden');
+      restartEl.classList.add('vp-hidden');
+      if (optionsEl) optionsEl.classList.add('vp-hidden');
+    }
+  }
+
+  function looksLikeRecommendation(text) {
+    return /\b(recommend|try|suggest|option|flavor|available|inventory|might enjoy|check out)\b/i.test(
+      String(text || '')
+    );
+  }
+
+  function updateRestartVisibility() {
+    var lastAssistant = null;
+    for (var i = state.messages.length - 1; i >= 0; i -= 1) {
+      if (state.messages[i].role === 'assistant') {
+        lastAssistant = state.messages[i].content;
+        break;
+      }
+    }
+    state.showRestart =
+      state.ageVerified &&
+      !state.locked &&
+      !state.booting &&
+      !state.sending &&
+      state.replyType !== 'options' &&
+      (state.replyType === 'recommendation' || looksLikeRecommendation(lastAssistant));
+    restartEl.classList.toggle('vp-hidden', !state.showRestart);
+  }
 
   function applyBrand(color) {
     if (!color) return;
@@ -358,7 +475,7 @@
 
   function renderMessages() {
     messagesEl.innerHTML = '';
-    state.messages.forEach(function (msg) {
+    state.messages.forEach(function (msg, index) {
       var wrap = document.createElement('div');
       wrap.className = 'vp-msg-wrap ' + (msg.role === 'user' ? 'user' : 'bot');
       var el = document.createElement('div');
@@ -369,6 +486,40 @@
       el.textContent = msg.content;
       wrap.appendChild(el);
       messagesEl.appendChild(wrap);
+
+      // Attach View Product CTA after the latest recommendation reply
+      var isLast = index === state.messages.length - 1;
+      if (
+        isLast &&
+        msg.role === 'assistant' &&
+        Array.isArray(state.recommendedProducts) &&
+        state.recommendedProducts.length &&
+        (state.replyType === 'recommendation' || state.recommendedProducts[0]?.productUrl)
+      ) {
+        state.recommendedProducts.forEach(function (product) {
+          if (!product) return;
+          var card = document.createElement('div');
+          card.className = 'vp-product-card';
+          var title = document.createElement('h4');
+          title.textContent = product.name || 'Recommended product';
+          card.appendChild(title);
+          if (product.description) {
+            var desc = document.createElement('p');
+            desc.textContent = String(product.description).slice(0, 220);
+            card.appendChild(desc);
+          }
+          if (product.productUrl || product.originalProductUrl) {
+            var link = document.createElement('a');
+            link.className = 'vp-view-product';
+            link.href = product.productUrl || product.originalProductUrl;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = 'View Product';
+            card.appendChild(link);
+          }
+          messagesEl.appendChild(card);
+        });
+      }
     });
 
     if (state.sending) {
@@ -385,9 +536,37 @@
   }
 
   function setLockedUi() {
+    if (state.booting) return;
+
     var showAgeButtons = !state.ageVerified && !state.locked;
     ageActionsEl.classList.toggle('vp-hidden', !showAgeButtons);
     composerWrapEl.classList.toggle('vp-hidden', showAgeButtons);
+
+    var showOptions =
+      !showAgeButtons &&
+      !state.locked &&
+      !state.sending &&
+      Array.isArray(state.currentOptions) &&
+      state.currentOptions.length > 0 &&
+      state.replyType === 'options';
+
+    if (optionsEl) {
+      optionsEl.classList.toggle('vp-hidden', !showOptions);
+      if (showOptions) {
+        optionsEl.innerHTML = '';
+        state.currentOptions.forEach(function (opt) {
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'vp-option-chip';
+          btn.textContent = (opt.emoji ? opt.emoji + ' ' : '') + (opt.label || opt.value || '');
+          btn.disabled = state.sending;
+          btn.addEventListener('click', function () {
+            sendMessage('::option::' + opt.id);
+          });
+          optionsEl.appendChild(btn);
+        });
+      }
+    }
 
     input.disabled = state.locked || state.sending;
     sendBtn.disabled = state.locked || state.sending;
@@ -399,6 +578,8 @@
       : state.ageVerified
         ? 'Recommendations from this store only'
         : 'Age verification required';
+
+    updateRestartVisibility();
   }
 
   function setOpen(open) {
@@ -434,20 +615,41 @@
     await waitForSiteAgeGate();
 
     try {
+      root.classList.remove('vp-hidden');
+      setBooting(true);
+      setLoadingStep('Syncing Inventory...', 'Please wait...');
+      setOpen(true);
+
+      await sleep(700);
+      setLoadingStep('Fetching Products...', 'Loading your store catalog...');
+
       var configRes = await api('/assistant/widget/' + encodeURIComponent(storeId));
       state.config = configRes.data.config;
 
       if (!state.config.enabled) {
-        console.info('[VapePass Assistant] Not enabled for this store yet');
+        console.info(
+          '[VapePass Assistant] Not enabled:',
+          state.config.disabledReason || 'unknown'
+        );
+        root.classList.add('vp-hidden');
         return;
       }
 
       warningEl.textContent = state.config.healthWarning;
       applyBrand(state.config.brandColor);
+      if (regionEl) regionEl.textContent = state.config.regionLabel || '';
+      if (minAgeEl) {
+        minAgeEl.textContent =
+          state.config.minimumAgeLabel ||
+          (state.config.legalAge ? 'Minimum Age: ' + state.config.legalAge + '+' : '');
+      }
 
       if (state.config.ageYesLabel) {
         ageYesBtn.textContent = state.config.ageYesLabel;
       }
+
+      await sleep(500);
+      setLoadingStep('Almost ready...', 'Starting your flavor assistant...');
 
       var existingKey = getStoredSessionKey();
       var sessionRes = await api('/assistant/session', {
@@ -456,9 +658,12 @@
       });
 
       applySession(sessionRes.data.session);
-      root.classList.remove('vp-hidden');
+      setBooting(false);
+      setLockedUi();
+      renderMessages();
     } catch (err) {
       console.error('[VapePass Assistant] Failed to initialize:', err.message);
+      root.classList.add('vp-hidden');
     }
   }
 
@@ -468,6 +673,9 @@
     state.messages = session.messages || [];
     state.ageVerified = Boolean(session.ageVerified);
     state.locked = Boolean(session.locked);
+    state.replyType = session.replyType || null;
+    state.currentOptions = Array.isArray(session.options) ? session.options : [];
+    state.recommendedProducts = Array.isArray(session.products) ? session.products : [];
     renderMessages();
     setLockedUi();
   }
@@ -475,9 +683,14 @@
   async function sendMessage(text) {
     if (!text || state.locked || state.sending) return;
     state.sending = true;
+    state.currentOptions = [];
     setLockedUi();
 
-    state.messages.push({ role: 'user', content: text });
+    var display = text;
+    if (text.indexOf('::option::') === 0) {
+      display = 'Selected';
+    }
+    state.messages.push({ role: 'user', content: display });
     renderMessages();
 
     try {
@@ -540,6 +753,10 @@
 
   ageNoBtn.addEventListener('click', function () {
     sendMessage('No');
+  });
+
+  restartBtn.addEventListener('click', function () {
+    sendMessage('I want another recommendation');
   });
 
   form.addEventListener('submit', function (e) {

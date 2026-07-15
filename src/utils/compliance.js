@@ -8,6 +8,7 @@ import {
   getAgeQuestion,
   getHealthWarning,
   getLockMessage,
+  getRegionLabel,
   resolveStoreLegalAge,
 } from './legalAge.js';
 
@@ -199,12 +200,31 @@ export function filterRecommendableProducts(products = []) {
  */
 export function getComplianceMessages(store) {
   const legalAge = resolveStoreLegalAge(store);
+  const regionLabel = getRegionLabel(store?.country, store?.province);
   return {
     legalAge,
+    regionLabel,
     ageQuestion: getAgeQuestion(legalAge),
     lockMessage: getLockMessage(legalAge, store?.country, store?.province),
     healthWarning: getHealthWarning(legalAge),
   };
+}
+
+/**
+ * Detects user intent to restart the recommendation flow (new flavor / another suggestion).
+ * Does not alter the recommendation engine — only resets conversation context.
+ */
+export function detectsRecommendationRestart(message) {
+  const text = String(message || '').trim().toLowerCase();
+  if (!text) return false;
+
+  return (
+    /\b(another recommendation|different (flavor|recommendation|one)|something else|start over|new recommendation|recommend (again|something else))\b/i.test(
+      text
+    ) ||
+    /\bi want (another|a different|something else)\b/i.test(text) ||
+    /\bget another recommendation\b/i.test(text)
+  );
 }
 
 /**
@@ -218,7 +238,7 @@ export function buildSystemPrompt(storeName, inventoryText, legalAge = DEFAULT_L
 
 The legal purchasing age at this location is strictly ${legalAge} years old.
 
-You must strictly enforce this age requirement, block any underage inquiries, and guide eligible users through the age verification process before discussing products or allowing checkout.
+You must strictly enforce this age requirement, block any underage inquiries, and guide eligible users through the age verification process before discussing products. Recommend products only — never mention carts, checkout, or purchasing flows.
 
 STRICT RULES YOU MUST FOLLOW AT ALL TIMES:
 1. Before any conversation you must ask: "${ageQuestion}"
@@ -261,14 +281,24 @@ export function formatInventoryForPrompt(products = []) {
   return sorted
     .map((p, i) => {
       const parts = [
-        `${i + 1}. ${p.name || [p.brand, p.flavor].filter(Boolean).join(' ') || 'Product'}`,
+        `${i + 1}. [id:${p._id}] ${p.name || [p.brand, p.flavor].filter(Boolean).join(' ') || 'Product'}`,
       ];
       if (p.isPriorityPromotion) parts.push('PRIORITY');
       if (p.brand) parts.push(`Brand: ${p.brand}`);
       if (p.flavor) parts.push(`Flavor: ${p.flavor}`);
-      if (p.nicotineMgMl != null) parts.push(`Nicotine: ${p.nicotineMgMl}mg/mL`);
-      if (p.volumeMl != null) parts.push(`Volume: ${p.volumeMl}mL`);
+      if (p.category) parts.push(`Category: ${p.category}`);
+      if (p.subcategory) parts.push(`Subcategory: ${p.subcategory}`);
+      if (p.variantName) parts.push(`Variant: ${p.variantName}`);
+      if (p.nicotineMgMl != null || p.nicotineStrength) {
+        parts.push(`Nicotine: ${p.nicotineStrength || `${p.nicotineMgMl}mg/mL`}`);
+      }
+      if (p.volumeMl != null || p.bottleSize) {
+        parts.push(`Size: ${p.bottleSize || `${p.volumeMl}mL`}`);
+      }
       if (p.productType) parts.push(`Type: ${p.productType}`);
+      if (p.description) {
+        parts.push(`Description: ${String(p.description).replace(/\s+/g, ' ').trim().slice(0, 220)}`);
+      }
       return parts.join(' | ');
     })
     .join('\n');
