@@ -82,6 +82,18 @@ const storeSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    /**
+     * Auto Subscription (auto-renew). Default ON for new stores.
+     * When false, Stripe subscription is set to cancel_at_period_end.
+     */
+    autoRenew: {
+      type: Boolean,
+      default: true,
+    },
+    autoRenewUpdatedAt: {
+      type: Date,
+      default: null,
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',

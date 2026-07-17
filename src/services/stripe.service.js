@@ -81,9 +81,17 @@ async function activateStoreSubscription(store, stripeSubscription) {
   store.paymentRetryCount = 0;
   store.lastPaymentFailedAt = null;
 
+  // New / reactivated subscriptions renew automatically unless the owner opted out
+  if (typeof store.autoRenew !== 'boolean') {
+    store.autoRenew = true;
+  }
+
   if (stripeSubscription) {
     store.stripeSubscriptionId = stripeSubscription.id || store.stripeSubscriptionId;
     applyPeriodDates(store, stripeSubscription);
+    if (typeof stripeSubscription.cancel_at_period_end === 'boolean') {
+      store.autoRenew = !stripeSubscription.cancel_at_period_end;
+    }
   }
 
   if (!store.subscriptionStartDate) {
@@ -119,6 +127,77 @@ async function activateStoreSubscription(store, stripeSubscription) {
       });
     }
   }
+}
+
+/**
+ * Update Stripe cancel_at_period_end to match autoRenew preference.
+ * autoRenew ON  → cancel_at_period_end false (renews)
+ * autoRenew OFF → cancel_at_period_end true  (ends after current period)
+ */
+async function syncStripeCancelAtPeriodEnd(store, autoRenew) {
+  if (!store.stripeSubscriptionId || !isConfigured()) return null;
+
+  const Stripe = (await import('stripe')).default;
+  const stripe = new Stripe(env.stripe.secretKey);
+  const cancelAtPeriodEnd = !autoRenew;
+
+  const subscription = await stripe.subscriptions.update(store.stripeSubscriptionId, {
+    cancel_at_period_end: cancelAtPeriodEnd,
+  });
+
+  applyPeriodDates(store, subscription);
+  return subscription;
+}
+
+/**
+ * Persist Auto Subscription preference and sync with Stripe.
+ */
+export async function setAutoRenew(store, enabled) {
+  if (typeof enabled !== 'boolean') {
+    throw new ApiError(400, 'enabled must be a boolean');
+  }
+
+  const { canAccessDashboard } = await import('../utils/subscriptionAccess.js');
+  if (!canAccessDashboard(store?.subscriptionStatus)) {
+    throw new ApiError(
+      403,
+      'Auto Subscription can only be changed while your subscription is active.'
+    );
+  }
+
+  if (!store.stripeSubscriptionId) {
+    throw new ApiError(
+      400,
+      'No active Stripe subscription found. Subscribe first, then manage Auto Subscription.'
+    );
+  }
+
+  if (!isConfigured()) {
+    throw new ApiError(503, 'Stripe is not configured. Add STRIPE_SECRET_KEY to .env');
+  }
+
+  const current = store.autoRenew !== false;
+  if (current === enabled) {
+    return {
+      autoRenew: current,
+      autoRenewUpdatedAt: store.autoRenewUpdatedAt || null,
+      nextBillingDate: store.nextBillingDate || null,
+      subscriptionEndDate: store.subscriptionEndDate || null,
+    };
+  }
+
+  const subscription = await syncStripeCancelAtPeriodEnd(store, enabled);
+  store.autoRenew = enabled;
+  store.autoRenewUpdatedAt = new Date();
+  await store.save();
+
+  return {
+    autoRenew: store.autoRenew,
+    autoRenewUpdatedAt: store.autoRenewUpdatedAt,
+    nextBillingDate: store.nextBillingDate || null,
+    subscriptionEndDate: store.subscriptionEndDate || null,
+    cancelAtPeriodEnd: Boolean(subscription?.cancel_at_period_end),
+  };
 }
 
 /**
@@ -315,6 +394,10 @@ export const handleWebhookEvent = async (event) => {
     case 'customer.subscription.updated': {
       store.stripeSubscriptionId = obj.id;
       applyPeriodDates(store, obj);
+      if (typeof obj.cancel_at_period_end === 'boolean') {
+        store.autoRenew = !obj.cancel_at_period_end;
+        store.autoRenewUpdatedAt = store.autoRenewUpdatedAt || new Date();
+      }
       const mapped = mapStripeSubscriptionStatus(obj.status);
 
       if (mapped === SUBSCRIPTION_STATUS.ACTIVE) {
@@ -400,4 +483,11 @@ export const getBillingInfo = (store = null) => ({
   subscriptionEndDate: store?.subscriptionEndDate || null,
   nextBillingDate: store?.nextBillingDate || null,
   paymentRetryCount: store?.paymentRetryCount || 0,
+  /** Auto Subscription — default ON */
+  autoRenew: store?.autoRenew !== false,
+  autoRenewUpdatedAt: store?.autoRenewUpdatedAt || null,
+  hasStripeSubscription: Boolean(store?.stripeSubscriptionId),
+  canManageAutoRenew:
+    Boolean(store?.stripeSubscriptionId) &&
+    ['active', 'past_due'].includes(String(store?.subscriptionStatus || '')),
 });

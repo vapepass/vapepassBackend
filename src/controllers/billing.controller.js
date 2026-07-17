@@ -1,3 +1,4 @@
+import { ApiError } from '../utils/constants.js';
 import { sendSuccess } from '../utils/apiResponse.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import * as storeService from '../services/store.service.js';
@@ -32,4 +33,23 @@ export const confirmCheckout = asyncHandler(async (req, res) => {
   );
 
   return sendSuccess(res, 200, 'Subscription activated', { store: updated });
+});
+
+export const updateAutoRenew = asyncHandler(async (req, res) => {
+  const enabled = req.body?.enabled;
+  if (typeof enabled !== 'boolean') {
+    throw new ApiError(400, 'Request body must include enabled: true or enabled: false');
+  }
+
+  const store = await storeService.getStoreByUser(req.user);
+  const result = await stripeService.setAutoRenew(store, enabled);
+
+  return sendSuccess(
+    res,
+    200,
+    enabled
+      ? 'Auto Subscription has been enabled successfully.'
+      : 'Auto Subscription has been disabled. Your plan stays active until the current period ends.',
+    result
+  );
 });

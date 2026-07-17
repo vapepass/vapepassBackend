@@ -6,6 +6,57 @@ const POD_HINT_RE = /\b(pod|cartridge|pre[- ]?filled|disposable)\b/i;
 const BOTTLE_HINT_RE = /\b(e[- ]?liquid|e[- ]?juice|refill|bottle|salt\s*nic)\b/i;
 
 /**
+ * Flexible match for the store's E-Liquids section (URL/title may vary).
+ * Matches: E-Liquids, E-Liquid, E Juice, E-Juice, Vape Juice, Vape Liquid, etc.
+ */
+export const ELIQUID_CATEGORY_RE =
+  /\b(e[\s_-]?liquids?|e[\s_-]?juices?|vape[\s_-]?juices?|vape[\s_-]?liquids?)\b/i;
+
+/**
+ * Categories that must never be scraped (hardware, tobacco, snacks, etc.).
+ * Evaluated after E-Liquid match so "Disposable E-Liquids" is still allowed.
+ */
+export const EXCLUDED_NON_ELIQUID_CATEGORY_RE =
+  /\b(devices?|vape\s*kits?|starter\s*kits?|disposable\s*vapes?|disposables?\b(?![\s_-]*e[\s_-]?(?:liquid|juice))|pods?\b|tanks?|coils?|batter(?:y|ies)|chargers?|accessories|glass(?:ware)?|apparel|clothing|cbd|nicotine\s*pouches?|pouches?|hardware|mods?\b|atomizers?|drip\s*tips?|cotton|wire|replacement\s*parts?|cigars?|cigarettes?|tobacco(?![\s_-]*(?:e[\s_-]?(?:liquid|juice)|flavor|flavour|series))|snacks?|beverages?|drinks?|food|bongs?|rigs?|pipes?|rolling|papers?|grinders?|hookah|shisha|herbal|vaporizers?|novelties|lighters?|torches?|ashtrays?|cones?|wraps?|smoking)\b/i;
+
+/** True when a category / collection / product-type name is the E-Liquids section. */
+export function isELiquidCategoryName(name) {
+  if (!name) return false;
+  return ELIQUID_CATEGORY_RE.test(String(name).replace(/[_-]+/g, ' ').trim());
+}
+
+/** True for clearly non–E-Liquid store sections (Devices, Pods, CBD, …). */
+export function isExcludedNonELiquidCategory(name) {
+  if (!name) return false;
+  const normalized = String(name).replace(/[_-]+/g, ' ').trim();
+  if (isELiquidCategoryName(normalized)) return false;
+  return EXCLUDED_NON_ELIQUID_CATEGORY_RE.test(normalized);
+}
+
+/**
+ * Safety check: keep inventory rows that belong to E-Liquids.
+ * Requires E-Liquids category membership or explicit e_liquid type / bottle naming.
+ * Never keeps rows whose category/subcategory is an excluded non–E-Liquid section.
+ */
+export function isLikelyELiquidProduct(product = {}) {
+  const category = product.category || '';
+  const subcategory = product.subcategory || '';
+  const productType = product.productType || '';
+  const name = product.name || '';
+  const text = `${category} ${subcategory} ${name} ${product.variantName || ''}`;
+
+  if (isExcludedNonELiquidCategory(category)) return false;
+  if (isExcludedNonELiquidCategory(subcategory)) return false;
+  if (isExcludedNonELiquidCategory(name) && !isELiquidCategoryName(category)) return false;
+
+  if (isELiquidCategoryName(category) || isELiquidCategoryName(subcategory)) {
+    return true;
+  }
+  if (productType === 'e_liquid' && BOTTLE_HINT_RE.test(text)) return true;
+  return false;
+}
+
+/**
  * Keep the storefront product URL intact — only trim / cap length.
  * Blocks dangerous schemes so "View Product" stays a safe new-tab open.
  */
@@ -38,10 +89,17 @@ export function buildRichProduct(title, productUrl, extras = {}) {
 
   let productType = extras.productType || 'other';
   if (productType === 'other') {
-    if (POD_HINT_RE.test(textForSpecs)) {
-      productType = volumeMl != null && volumeMl <= 2 ? 'pod' : 'prefilled';
-    } else if (BOTTLE_HINT_RE.test(textForSpecs) || (volumeMl != null && volumeMl > 2)) {
+    // Prefer bottle / volume signals over pod hints — "disposable" in a description
+    // must not turn a 30mL E-Liquid into productType "prefilled" (that fails BC bottle rules).
+    if (
+      isELiquidCategoryName(extras.category) ||
+      isELiquidCategoryName(extras.subcategory) ||
+      BOTTLE_HINT_RE.test(textForSpecs) ||
+      (volumeMl != null && volumeMl > 2)
+    ) {
       productType = 'e_liquid';
+    } else if (POD_HINT_RE.test(textForSpecs)) {
+      productType = volumeMl != null && volumeMl <= 2 ? 'pod' : 'prefilled';
     }
   }
 

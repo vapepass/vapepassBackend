@@ -258,10 +258,8 @@ function buildRecommendationText(product) {
   const nic = product.nicotineStrength || (product.nicotineMgMl != null ? `${product.nicotineMgMl}mg` : null);
   const size = product.bottleSize || (product.volumeMl != null ? `${product.volumeMl}mL` : null);
   const specs = [nic, size].filter(Boolean).join(' · ');
-  const desc = product.description
-    ? ` ${String(product.description).replace(/\s+/g, ' ').trim().slice(0, 180)}`
-    : '';
-  return `Based on what you told me, I'd recommend ${bits.join(' — ')}${specs ? ` (${specs})` : ''}.${desc ? desc : ''} Please note that vaping products contain nicotine, which is addictive.`;
+  // Keep the spoken reply short — full marketing copy belongs on the product page / card blurb.
+  return `Based on what you told me, I'd recommend ${bits.join(' — ')}${specs ? ` (${specs})` : ''}.`;
 }
 
 async function pickBestProduct(store, pool, path, userHint) {

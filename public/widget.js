@@ -37,6 +37,73 @@
   var SESSION_KEY = 'vapepass_assistant_session_' + storeId;
   var AGE_GATE_KEY = 'vapepass_site_age_verified';
 
+  /** Split parent product name from variant so cards show both clearly. */
+  function resolveRecommendationDisplay(product) {
+    product = product || {};
+    var rawName = String(product.name || '').trim();
+    var variant = String(product.variantName || product.flavor || '').trim();
+    var title = rawName || 'Recommended product';
+
+    if (variant && rawName) {
+      var escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      var stripped = rawName
+        .replace(new RegExp('\\s*[-–|/:]\\s*' + escaped + '\\s*$', 'i'), '')
+        .trim();
+      if (stripped && stripped.length >= 2 && stripped.toLowerCase() !== rawName.toLowerCase()) {
+        title = stripped;
+      }
+    }
+
+    var showVariant = Boolean(variant) && variant.toLowerCase() !== title.toLowerCase();
+    return { title: title, variant: showVariant ? variant : null };
+  }
+
+  var MARKETING_CUT_RE =
+    /\b(why choose|technical specifications?|important notice|warning:|shop .{0,40} online|explore more|premium quality you can trust|device compatibility|ideal for|available in a convenient)\b/i;
+
+  function summarizeProductBlurb(text, maxLen) {
+    maxLen = maxLen || 140;
+    if (!text) return null;
+    var cleaned = String(text)
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/[→👉💨⚡🔒]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!cleaned) return null;
+
+    var cutAt = cleaned.search(MARKETING_CUT_RE);
+    if (cutAt > 48) {
+      cleaned = cleaned.slice(0, cutAt).trim().replace(/[|·•\-–—:\s]+$/g, '');
+    }
+
+    var sentences = cleaned.match(/[^.!?]+[.!?]+/g);
+    if (sentences && sentences.length) {
+      var blurb = sentences[0].trim();
+      if (blurb.length < 70 && sentences[1]) {
+        blurb = blurb + ' ' + sentences[1].trim();
+      }
+      cleaned = blurb;
+    }
+
+    if (cleaned.length > maxLen) {
+      cleaned = cleaned.slice(0, maxLen - 1).replace(/\s+\S*$/, '').trim() + '…';
+    }
+    return cleaned || null;
+  }
+
+  function summarizeRecommendationIntro(intro) {
+    if (!intro) return null;
+    var text = String(intro).replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    text = text.replace(/\s*Please note that vaping products contain nicotine[^.]*\./gi, '').trim();
+    var recommendMatch = text.match(/^(Based on what you told me,\s*I'd recommend[^.]*\.)/i);
+    if (recommendMatch) return recommendMatch[1];
+    var firstSentence = text.match(/^[^.!?]+[.!?]/);
+    if (firstSentence && firstSentence[0].length <= 220) return firstSentence[0].trim();
+    if (text.length > 180) return text.slice(0, 179).replace(/\s+\S*$/, '').trim() + '…';
+    return text;
+  }
+
   var state = {
     config: null,
     sessionKey: null,
@@ -218,8 +285,12 @@
     '  margin: 4px 0 10px; padding: 12px; border: 1px solid #E5E7EB; border-radius: 16px;',
     '  background: linear-gradient(180deg, #fff, #faf9ff); max-width: 92%;',
     '}',
-    '.vp-product-card h4 { margin: 0; font-size: 14px; font-weight: 650; color: #111827; }',
+    '.vp-product-card h4 { margin: 0; font-size: 14px; font-weight: 650; color: #111827; line-height: 1.35; }',
+    '.vp-product-variant { margin: 8px 0 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 8px; }',
+    '.vp-product-variant-label { font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #7C3AED; }',
+    '.vp-product-variant-name { font-size: 13px; font-weight: 600; color: #5B21B6; line-height: 1.35; }',
     '.vp-product-card p { margin: 6px 0 0; font-size: 12px; color: #4B5563; line-height: 1.45; }',
+    '.vp-product-card .vp-product-brand { margin: 6px 0 0; font-size: 12px; color: #6B7280; }',
     '.vp-view-product {',
     '  display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 10px;',
     '  height: 38px; border-radius: 9999px; background: #8B5CF6; color: #fff; text-decoration: none;',
@@ -483,7 +554,15 @@
         'vp-msg ' +
         (msg.role === 'user' ? 'user' : 'bot') +
         (state.locked && msg.role === 'assistant' ? ' locked' : '');
-      el.textContent = msg.content;
+      var isRecBubble =
+        msg.role === 'assistant' &&
+        index === state.messages.length - 1 &&
+        Array.isArray(state.recommendedProducts) &&
+        state.recommendedProducts.length &&
+        (state.replyType === 'recommendation' || state.recommendedProducts[0]?.productUrl);
+      el.textContent = isRecBubble
+        ? summarizeRecommendationIntro(msg.content) || msg.content
+        : msg.content;
       wrap.appendChild(el);
       messagesEl.appendChild(wrap);
 
@@ -498,14 +577,39 @@
       ) {
         state.recommendedProducts.forEach(function (product) {
           if (!product) return;
+          var display = resolveRecommendationDisplay(product);
+          var blurb = summarizeProductBlurb(product.description);
           var card = document.createElement('div');
           card.className = 'vp-product-card';
+
           var title = document.createElement('h4');
-          title.textContent = product.name || 'Recommended product';
+          title.textContent = display.title;
           card.appendChild(title);
-          if (product.description) {
+
+          if (display.variant) {
+            var variantRow = document.createElement('div');
+            variantRow.className = 'vp-product-variant';
+            var variantLabel = document.createElement('span');
+            variantLabel.className = 'vp-product-variant-label';
+            variantLabel.textContent = 'Variant';
+            var variantName = document.createElement('span');
+            variantName.className = 'vp-product-variant-name';
+            variantName.textContent = display.variant;
+            variantRow.appendChild(variantLabel);
+            variantRow.appendChild(variantName);
+            card.appendChild(variantRow);
+          }
+
+          if (product.brand) {
+            var brand = document.createElement('p');
+            brand.className = 'vp-product-brand';
+            brand.textContent = product.brand;
+            card.appendChild(brand);
+          }
+
+          if (blurb) {
             var desc = document.createElement('p');
-            desc.textContent = String(product.description).slice(0, 220);
+            desc.textContent = blurb;
             card.appendChild(desc);
           }
           if (product.productUrl || product.originalProductUrl) {

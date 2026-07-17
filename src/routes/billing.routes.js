@@ -60,4 +60,28 @@ router.post('/portal', billingController.createPortal);
  */
 router.post('/confirm', billingController.confirmCheckout);
 
+/**
+ * @swagger
+ * /billing/auto-renew:
+ *   patch:
+ *     summary: Enable or disable Auto Subscription (auto-renew)
+ *     tags: [Billing]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [enabled]
+ *             properties:
+ *               enabled:
+ *                 type: boolean
+ *     responses:
+ *       200:
+ *         description: Auto Subscription preference updated
+ */
+router.patch('/auto-renew', billingController.updateAutoRenew);
+
 export default router;
