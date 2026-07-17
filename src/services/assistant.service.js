@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import Store from '../models/Store.js';
 import ChatSession from '../models/ChatSession.js';
+import StoreInventory from '../models/StoreInventory.js';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/constants.js';
 import {
@@ -33,18 +34,23 @@ export async function getWidgetConfig(storeId, options = {}) {
   const store =
     options.store ||
     (await Store.findById(storeId).select(
-      'name brandColor assistantEnabled productPageUrl websiteUrl country province legalAge subscriptionStatus setupCompletedAt inventorySyncStatus'
+      'name brandColor assistantEnabled productPageUrl websiteUrl country province legalAge subscriptionStatus setupCompletedAt inventorySyncStatus inventoryProductCount'
     ));
   if (!store) {
     throw new ApiError(404, 'Store not found');
   }
 
-  const inventory = await getRecommendableInventory(store._id);
+  // Fast path for bootstrap — avoid loading every inventory document into memory
+  const productCount =
+    typeof store.inventoryProductCount === 'number' && store.inventoryProductCount > 0
+      ? store.inventoryProductCount
+      : await StoreInventory.countDocuments({ storeId: store._id, isActive: true });
+
   const compliance = getComplianceMessages(store);
   const domainDenied = Boolean(options.domainDenied);
   const demoMode = Boolean(options.demoMode);
   const serveOk = canServeChatbot(store, { demoMode });
-  const enabled = !domainDenied && serveOk && inventory.length > 0;
+  const enabled = !domainDenied && serveOk && productCount > 0;
 
   return {
     storeId: store._id,
@@ -65,10 +71,10 @@ export async function getWidgetConfig(storeId, options = {}) {
       ? 'unauthorized_domain'
       : !serveOk
         ? 'subscription_or_setup'
-        : inventory.length === 0
+        : productCount === 0
           ? 'no_inventory'
           : null,
-    productCount: inventory.length,
+    productCount,
     syncing: store.inventorySyncStatus === 'syncing' || store.inventorySyncStatus === 'pending',
   };
 }

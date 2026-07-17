@@ -20,6 +20,28 @@ function isMarketingDemoOrigin(origin) {
     return true;
   }
 
+  // Extra marketing / preview hosts (comma-separated), e.g. projectclient-zeta.vercel.app
+  const extra = [
+    ...env.marketingDemoHosts,
+    ...String(process.env.MARKETING_DEMO_HOSTS || '')
+      .split(',')
+      .map((h) => h.trim()),
+  ]
+    .map((h) => normalizeHostname(h) || extractHostname(h))
+    .filter(Boolean);
+  if (extra.includes(normalizeHostname(host))) {
+    return true;
+  }
+
+  // Vercel preview deployments of the marketing site when CLIENT_URL host is also on Vercel
+  if (
+    clientHost &&
+    clientHost.endsWith('.vercel.app') &&
+    host.endsWith('.vercel.app')
+  ) {
+    return true;
+  }
+
   // Local Next.js marketing/demo host during development
   if (env.nodeEnv !== 'production') {
     return host === 'localhost' || host === '127.0.0.1' || host.endsWith('.localhost');
@@ -52,7 +74,11 @@ export const requireValidEmbedAccess = asyncHandler(async (req, res, next) => {
   const allowLocalhost = env.nodeEnv !== 'production';
   const originOptions = {
     allowLocalhost,
-    extraHosts: [env.clientUrl, env.apiPublicUrl].filter(Boolean),
+    extraHosts: [
+      env.clientUrl,
+      env.apiPublicUrl,
+      ...(env.marketingDemoHosts || []),
+    ].filter(Boolean),
   };
 
   if (!demoMode && !hasServiceableSubscription(store)) {
@@ -66,13 +92,13 @@ export const requireValidEmbedAccess = asyncHandler(async (req, res, next) => {
     if (!origin) {
       throw new ApiError(403, 'Unauthorized embed origin', { code: 'ORIGIN_REQUIRED' });
     }
-    if (!isOriginAllowedForStore(origin, store, { ...originOptions, allowLocalhost: false })) {
+    if (!demoMode && !isOriginAllowedForStore(origin, store, { ...originOptions, allowLocalhost: false })) {
       throw new ApiError(403, 'Embedding is not authorized for this website', {
         code: 'ORIGIN_NOT_ALLOWED',
         allowedHostname: getStoreAllowedHostname(store),
       });
     }
-  } else if (origin && !isOriginAllowedForStore(origin, store, originOptions)) {
+  } else if (origin && !demoMode && !isOriginAllowedForStore(origin, store, originOptions)) {
     throw new ApiError(403, 'Embedding is not authorized for this website', {
       code: 'ORIGIN_NOT_ALLOWED',
       allowedHostname: getStoreAllowedHostname(store),
@@ -100,22 +126,26 @@ export const loadEmbedStore = asyncHandler(async (req, res, next) => {
   }
 
   const origin = getRequestOrigin(req);
+  const demoMode = isMarketingDemoOrigin(origin);
   const allowLocalhost = env.nodeEnv !== 'production';
   const originOptions = {
     allowLocalhost,
-    extraHosts: [env.clientUrl, env.apiPublicUrl].filter(Boolean),
+    extraHosts: [
+      env.clientUrl,
+      env.apiPublicUrl,
+      ...(env.marketingDemoHosts || []),
+    ].filter(Boolean),
   };
 
-  if (origin) {
+  if (origin && !demoMode) {
     const allowed = isOriginAllowedForStore(origin, store, originOptions);
     if (!allowed && getStoreAllowedHostname(store)) {
       req.embedDomainDenied = true;
     }
-  } else if (env.nodeEnv === 'production' && getStoreAllowedHostname(store)) {
+  } else if (!origin && env.nodeEnv === 'production' && getStoreAllowedHostname(store) && !demoMode) {
     req.embedDomainDenied = true;
   }
 
-  const demoMode = isMarketingDemoOrigin(origin);
   req.embedStore = store;
   req.embedDemoMode = demoMode;
   req.embedCanServe =

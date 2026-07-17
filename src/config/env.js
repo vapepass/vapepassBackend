@@ -18,6 +18,11 @@ export const env = {
   jwtRefreshSecret: process.env.JWT_REFRESH_SECRET,
   jwtRefreshExpires: process.env.JWT_REFRESH_EXPIRES || '7d',
   clientUrl: process.env.CLIENT_URL || 'http://localhost:3000',
+  /** Comma-separated hostnames allowed as marketing/demo chatbot origins */
+  marketingDemoHosts: String(process.env.MARKETING_DEMO_HOSTS || '')
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean),
   passkit: {
     apiKey: process.env.PASSKIT_API_KEY,
     apiSecret: process.env.PASSKIT_API_SECRET,
