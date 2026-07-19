@@ -40,3 +40,12 @@ export const CUSTOMER_STATUS = {
   ACTIVE: 'active',
   REWARDED: 'rewarded',
 };
+
+/** Free setup assistance request lifecycle */
+export const SETUP_REQUEST_STATUS = {
+  PENDING: 'Pending',
+  CONTACTED: 'Contacted',
+  SCHEDULED: 'Scheduled',
+  COMPLETED: 'Completed',
+  CANCELLED: 'Cancelled',
+};

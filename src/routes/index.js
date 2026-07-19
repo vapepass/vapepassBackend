@@ -10,6 +10,7 @@ import adminRoutes from './admin.routes.js';
 import publicRoutes from './public.routes.js';
 import assistantRoutes from './assistant.routes.js';
 import cronRoutes from './cron.routes.js';
+import supportRoutes from './support.routes.js';
 
 const router = Router();
 
@@ -24,5 +25,6 @@ router.use('/analytics', analyticsRoutes);
 router.use('/admin', adminRoutes);
 router.use('/assistant', assistantRoutes);
 router.use('/cron', cronRoutes);
+router.use('/support', supportRoutes);
 
 export default router;

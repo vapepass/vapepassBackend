@@ -46,6 +46,11 @@ export const env = {
     pass: process.env.SMTP_PASS,
     from: process.env.EMAIL_FROM,
     logoUrl: process.env.EMAIL_LOGO_URL,
+    /** Inbox for Free Setup Request admin notifications */
+    supportAdmin:
+      process.env.SUPPORT_ADMIN_EMAIL ||
+      process.env.ADMIN_EMAIL ||
+      'admin@vapepass.com',
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY,

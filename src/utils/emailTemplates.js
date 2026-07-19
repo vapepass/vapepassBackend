@@ -50,6 +50,28 @@ function formatDate(value) {
   });
 }
 
+function formatDateTime(value) {
+  if (!value) return '—';
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleString('en-CA', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function formatMoney(amount, currency = 'USD') {
   const value = typeof amount === 'number' ? amount : Number(amount);
   if (Number.isNaN(value)) return '—';
@@ -259,6 +281,130 @@ export function buildSubscriptionPausedEmail({ storeName }) {
         Your subscription for <strong style="color:${BRAND.ink};">${storeName || 'your store'}</strong> is paused after repeated payment failures.
         The dashboard is locked and the chatbot embedding script will not load until you update billing.
       </p>
+    `,
+  });
+
+  return { subject, text, html };
+}
+
+/**
+ * Customer confirmation after Free Setup Assistance request.
+ */
+export function buildSetupRequestCustomerEmail({
+  customerName,
+  storeName,
+  websiteUrl,
+}) {
+  const safeName = escapeHtml(customerName || 'there');
+  const safeStore = escapeHtml(storeName || 'Your store');
+  const safeWebsite = escapeHtml(websiteUrl || '—');
+  const subject = 'Request Received – VapePass Free Setup Assistance';
+
+  const text = [
+    `Hello ${customerName || 'there'},`,
+    '',
+    'Thank you for requesting our Free Setup Assistance.',
+    '',
+    'We have successfully received your request.',
+    '',
+    'Our support team will contact you during business hours to help install the VapePass AI Assistant on your website.',
+    '',
+    'If required, we can schedule a live support session to complete the installation together.',
+    '',
+    `Store: ${storeName || 'Your store'}`,
+    `Website: ${websiteUrl || '—'}`,
+    '',
+    'Thank you for choosing VapePass.',
+    '',
+    'Best Regards,',
+    'The VapePass Team',
+  ].join('\n');
+
+  const html = wrapEmailLayout({
+    title: 'Free Setup Assistance',
+    preheader: 'We received your VapePass free setup request.',
+    bodyHtml: `
+      <h1 style="margin:0 0 12px;font-size:22px;color:${BRAND.ink};">Request received</h1>
+      <p style="margin:0 0 16px;color:${BRAND.muted};font-size:15px;line-height:1.6;">
+        Hello ${safeName},
+      </p>
+      <p style="margin:0 0 16px;color:${BRAND.muted};font-size:15px;line-height:1.6;">
+        Thank you for requesting our Free Setup Assistance. We have successfully received your request.
+      </p>
+      <p style="margin:0 0 16px;color:${BRAND.muted};font-size:15px;line-height:1.6;">
+        Our support team will contact you during business hours to help install the VapePass AI Assistant on your website.
+      </p>
+      <p style="margin:0 0 20px;color:${BRAND.muted};font-size:15px;line-height:1.6;">
+        If required, we can schedule a live support session to complete the installation together.
+      </p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${BRAND.bg};border-radius:12px;">
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};">Store<br/><strong style="color:${BRAND.ink};">${safeStore}</strong></td></tr>
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};border-top:1px solid ${BRAND.border};">Website<br/><strong style="color:${BRAND.ink};word-break:break-all;">${safeWebsite}</strong></td></tr>
+      </table>
+      <p style="margin:20px 0 0;color:${BRAND.muted};font-size:15px;line-height:1.6;">
+        Thank you for choosing VapePass.
+      </p>
+    `,
+  });
+
+  return { subject, text, html };
+}
+
+/**
+ * Admin notification for a new Free Setup Assistance request.
+ */
+export function buildSetupRequestAdminEmail({
+  customerName,
+  storeName,
+  email,
+  phone,
+  websiteUrl,
+  message,
+  submittedAt,
+}) {
+  const submitted = formatDateTime(submittedAt || new Date());
+  const safe = {
+    customerName: escapeHtml(customerName || '—'),
+    storeName: escapeHtml(storeName || '—'),
+    email: escapeHtml(email || '—'),
+    phone: escapeHtml(phone || '—'),
+    websiteUrl: escapeHtml(websiteUrl || '—'),
+    message: escapeHtml(message || '—'),
+    submitted: escapeHtml(submitted),
+  };
+
+  const subject = 'New Free Setup Request';
+  const text = [
+    'New Free Setup Request',
+    '',
+    `Customer Name: ${customerName || '—'}`,
+    `Store Name: ${storeName || '—'}`,
+    `Email: ${email || '—'}`,
+    `Phone Number: ${phone || '—'}`,
+    `Website URL: ${websiteUrl || '—'}`,
+    `Message: ${message || '—'}`,
+    `Submission Date & Time: ${submitted}`,
+    '',
+    'Please follow up during business hours.',
+  ].join('\n');
+
+  const html = wrapEmailLayout({
+    title: 'New Setup Request',
+    preheader: `${customerName || 'A customer'} requested free setup assistance.`,
+    bodyHtml: `
+      <h1 style="margin:0 0 12px;font-size:22px;color:${BRAND.ink};">New Free Setup Request</h1>
+      <p style="margin:0 0 20px;color:${BRAND.muted};font-size:15px;line-height:1.6;">
+        A customer submitted a Free Setup Assistance request. Details below:
+      </p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${BRAND.bg};border-radius:12px;">
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};">Customer Name<br/><strong style="color:${BRAND.ink};">${safe.customerName}</strong></td></tr>
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};border-top:1px solid ${BRAND.border};">Store Name<br/><strong style="color:${BRAND.ink};">${safe.storeName}</strong></td></tr>
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};border-top:1px solid ${BRAND.border};">Email<br/><strong style="color:${BRAND.ink};">${safe.email}</strong></td></tr>
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};border-top:1px solid ${BRAND.border};">Phone Number<br/><strong style="color:${BRAND.ink};">${safe.phone}</strong></td></tr>
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};border-top:1px solid ${BRAND.border};">Website URL<br/><strong style="color:${BRAND.ink};word-break:break-all;">${safe.websiteUrl}</strong></td></tr>
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};border-top:1px solid ${BRAND.border};">Optional Message<br/><strong style="color:${BRAND.ink};white-space:pre-wrap;">${safe.message}</strong></td></tr>
+        <tr><td style="padding:14px 18px;font-size:14px;color:${BRAND.muted};border-top:1px solid ${BRAND.border};">Submission Date &amp; Time<br/><strong style="color:${BRAND.ink};">${safe.submitted}</strong></td></tr>
+      </table>
     `,
   });
 
