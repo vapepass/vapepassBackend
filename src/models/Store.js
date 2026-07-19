@@ -132,7 +132,7 @@ const storeSchema = new mongoose.Schema(
     },
     inventorySyncStatus: {
       type: String,
-      enum: ['idle', 'pending', 'syncing', 'success', 'error'],
+      enum: ['idle', 'pending', 'syncing', 'success', 'error', 'stopped'],
       default: 'idle',
     },
     inventorySyncError: {

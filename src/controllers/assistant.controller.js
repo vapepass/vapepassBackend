@@ -60,6 +60,11 @@ export const refreshInventory = asyncHandler(async (req, res) => {
   return sendSuccess(res, 202, 'Inventory refresh started', result);
 });
 
+export const stopInventorySync = asyncHandler(async (req, res) => {
+  const result = await inventoryService.stopInventorySync(req.user);
+  return sendSuccess(res, 200, 'Inventory scrape stop requested', result);
+});
+
 export const listInventory = asyncHandler(async (req, res) => {
   const products = await inventoryService.getStoreInventory(req.user.storeId, {
     activeOnly: req.query.activeOnly !== 'false',

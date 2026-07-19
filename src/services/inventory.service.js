@@ -11,6 +11,13 @@ import {
 import { scrapeStoreProducts } from './scraper.service.js';
 import { sanitizeProductPageUrl } from './scraper.catalog.js';
 import { buildAndStoreRecommendationTaxonomy } from './taxonomy.service.js';
+import {
+  abortScrapeJob,
+  assertScrapeNotAborted,
+  clearScrapeJob,
+  registerScrapeJob,
+  ScrapeAbortedError,
+} from './scrapeJobs.js';
 
 export const MANUAL_REFRESHES_PER_MONTH = 2;
 
@@ -49,11 +56,70 @@ export function buildEmbedCode(storeId) {
   return `<script src="${buildWidgetScriptUrl()}" data-store-id="${storeId}" async></script>`;
 }
 
+async function upsertScrapedProduct(storeId, item, now) {
+  const externalId = item.externalId || String(item.name || '').toLowerCase();
+  if (!externalId) return null;
+
+  const $set = {
+    name: item.name,
+    brand: item.brand,
+    flavor: item.flavor,
+    description: item.description ?? null,
+    descriptionHash: item.descriptionHash ?? null,
+    descriptionSource: item.descriptionSource ?? null,
+    imageUrl: item.imageUrl ?? null,
+    category: item.category ?? null,
+    subcategory: item.subcategory ?? null,
+    variantName: item.variantName ?? null,
+    parentExternalId: item.parentExternalId ?? null,
+    nicotineMgMl: item.nicotineMgMl,
+    nicotineStrength: item.nicotineStrength ?? null,
+    volumeMl: item.volumeMl,
+    bottleSize: item.bottleSize ?? null,
+    price: item.price ?? null,
+    productType: item.productType,
+    platform: item.platform || 'unknown',
+    isActive: true,
+    status: 'active',
+    lastSeenAt: now,
+  };
+
+  // Never wipe a previously saved storefront URL if this scrape missed it.
+  const cleanedUrl = sanitizeProductPageUrl(item.productUrl);
+  if (cleanedUrl) {
+    $set.productUrl = cleanedUrl;
+  }
+
+  await StoreInventory.findOneAndUpdate(
+    { storeId, externalId },
+    {
+      $set,
+      $setOnInsert: {
+        isPriorityPromotion: false,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  return externalId;
+}
+
+async function refreshLiveProductCount(storeId) {
+  const activeCount = await StoreInventory.countDocuments({
+    storeId,
+    isActive: true,
+  });
+  await Store.findByIdAndUpdate(storeId, {
+    $set: { inventoryProductCount: activeCount },
+  });
+  return activeCount;
+}
+
 /**
  * Sync inventory for a single store from its website URL.
- * Upserts into store_inventories — never creates duplicates.
+ * Upserts into store_inventories incrementally (live product count).
  * Preserves isPriorityPromotion across syncs.
- * After sync, GPT rebuilds the dynamic recommendation taxonomy.
+ * Supports Force Stop via AbortController — already-saved products are kept.
  *
  * @param {string|import('mongoose').Types.ObjectId} storeId
  * @param {{ isManualRefresh?: boolean, isInitial?: boolean }} [options]
@@ -68,64 +134,58 @@ export async function syncStoreInventory(storeId, options = {}) {
     throw new ApiError(400, 'Store has no website URL configured');
   }
 
+  const controller = registerScrapeJob(store._id);
+  const { signal } = controller;
+
   store.inventorySyncStatus = 'syncing';
   store.inventorySyncError = null;
   store.inventorySyncAttempts = (store.inventorySyncAttempts || 0) + 1;
   await store.save();
 
-  try {
-    const scraped = await scrapeStoreProducts(store.productPageUrl);
-    const now = new Date();
-    const seenExternalIds = new Set();
+  const now = new Date();
+  const seenExternalIds = new Set();
+  let lastCountWriteAt = 0;
+  let platformHint = store.detectedPlatform || null;
 
-    for (const item of scraped) {
-      const externalId = item.externalId || item.name.toLowerCase();
-      seenExternalIds.add(externalId);
+  const persistBatch = async (batch = []) => {
+    assertScrapeNotAborted(signal);
+    if (!batch.length) return;
 
-      const $set = {
-        name: item.name,
-        brand: item.brand,
-        flavor: item.flavor,
-        description: item.description ?? null,
-        descriptionHash: item.descriptionHash ?? null,
-        descriptionSource: item.descriptionSource ?? null,
-        imageUrl: item.imageUrl ?? null,
-        category: item.category ?? null,
-        subcategory: item.subcategory ?? null,
-        variantName: item.variantName ?? null,
-        parentExternalId: item.parentExternalId ?? null,
-        nicotineMgMl: item.nicotineMgMl,
-        nicotineStrength: item.nicotineStrength ?? null,
-        volumeMl: item.volumeMl,
-        bottleSize: item.bottleSize ?? null,
-        price: item.price ?? null,
-        productType: item.productType,
-        platform: item.platform || 'unknown',
-        isActive: true,
-        status: 'active',
-        lastSeenAt: now,
-      };
-
-      // Never wipe a previously saved storefront URL if this scrape missed it.
-      // Keep productUrl only in $set (never also in $setOnInsert — Mongo conflict).
-      const cleanedUrl = sanitizeProductPageUrl(item.productUrl);
-      if (cleanedUrl) {
-        $set.productUrl = cleanedUrl;
-      }
-
-      await StoreInventory.findOneAndUpdate(
-        { storeId: store._id, externalId },
-        {
-          $set,
-          $setOnInsert: {
-            isPriorityPromotion: false,
-          },
-        },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
+    for (const item of batch) {
+      assertScrapeNotAborted(signal);
+      const externalId = await upsertScrapedProduct(store._id, item, now);
+      if (externalId) seenExternalIds.add(externalId);
+      if (item.platform) platformHint = item.platform;
     }
 
-    // Products no longer on the site are deactivated (chatbot stops recommending them)
+    // Throttle store count writes so polling sees progress without hammering Mongo
+    const t = Date.now();
+    if (t - lastCountWriteAt >= 800 || seenExternalIds.size <= 5) {
+      lastCountWriteAt = t;
+      await refreshLiveProductCount(store._id);
+    }
+  };
+
+  try {
+    const scraped = await scrapeStoreProducts(store.productPageUrl, {
+      signal,
+      onProductBatch: persistBatch,
+    });
+
+    assertScrapeNotAborted(signal);
+
+    // Persist any rows the scraper returned without streaming (safety net)
+    const remaining = scraped.filter((item) => {
+      const id = item.externalId || String(item.name || '').toLowerCase();
+      return id && !seenExternalIds.has(id);
+    });
+    if (remaining.length) {
+      await persistBatch(remaining);
+    }
+
+    assertScrapeNotAborted(signal);
+
+    // Full crawl finished — deactivate products no longer on the site
     await StoreInventory.updateMany(
       {
         storeId: store._id,
@@ -135,56 +195,144 @@ export async function syncStoreInventory(storeId, options = {}) {
       { $set: { isActive: false, status: 'inactive' } }
     );
 
-    const activeCount = await StoreInventory.countDocuments({
-      storeId: store._id,
-      isActive: true,
-    });
+    const activeCount = await refreshLiveProductCount(store._id);
+    const fresh = await Store.findById(store._id);
+    if (!fresh) throw new ApiError(404, 'Store not found');
 
-    store.inventorySyncStatus = 'success';
-    store.inventorySyncError = null;
-    store.lastInventorySyncAt = now;
-    store.inventoryProductCount = activeCount;
-    store.detectedPlatform = scraped[0]?.platform || store.detectedPlatform || null;
+    fresh.inventorySyncStatus = 'success';
+    fresh.inventorySyncError = null;
+    fresh.lastInventorySyncAt = now;
+    fresh.inventoryProductCount = activeCount;
+    fresh.detectedPlatform = platformHint || scraped[0]?.platform || fresh.detectedPlatform || null;
 
-    if (!store.inventoryInitialSyncedAt) {
-      store.inventoryInitialSyncedAt = now;
+    if (!fresh.inventoryInitialSyncedAt) {
+      fresh.inventoryInitialSyncedAt = now;
     }
 
-    // Chatbot stays off until Finish Setup / Go Live (and subscription is active)
-    if (store.setupCompletedAt && hasServiceableSubscription(store)) {
-      store.assistantEnabled = activeCount > 0;
-    } else if (!store.setupCompletedAt) {
-      store.assistantEnabled = false;
+    if (fresh.setupCompletedAt && hasServiceableSubscription(fresh)) {
+      fresh.assistantEnabled = activeCount > 0;
+    } else if (!fresh.setupCompletedAt) {
+      fresh.assistantEnabled = false;
     }
 
-    await store.save();
+    await fresh.save();
 
     console.log(
-      `[inventory] Synced ${activeCount} active products for store ${store._id} (variants expanded, no duplicates)`
+      `[inventory] Synced ${activeCount} active products for store ${fresh._id} (variants expanded, no duplicates)`
     );
 
-    // Rebuild GPT recommendation hierarchy from the latest inventory
     try {
-      await buildAndStoreRecommendationTaxonomy(store._id);
+      await buildAndStoreRecommendationTaxonomy(fresh._id);
     } catch (error) {
       console.warn(`[inventory] Taxonomy rebuild failed: ${error.message}`);
     }
 
     return {
-      storeId: store._id,
+      storeId: fresh._id,
       productCount: activeCount,
-      platform: store.detectedPlatform,
+      platform: fresh.detectedPlatform,
       syncedAt: now,
       isManualRefresh: Boolean(options.isManualRefresh),
       isInitial: Boolean(options.isInitial),
+      stopped: false,
     };
   } catch (error) {
+    const aborted =
+      error instanceof ScrapeAbortedError ||
+      error?.name === 'ScrapeAbortedError' ||
+      error?.code === 'SCRAPE_ABORTED' ||
+      signal.aborted;
+
+    const activeCount = await refreshLiveProductCount(store._id).catch(() => 0);
+    const fresh = await Store.findById(store._id);
+
+    if (aborted && fresh) {
+      // Keep every product already upserted; do not deactivate unseen SKUs
+      fresh.inventorySyncStatus = 'stopped';
+      fresh.inventorySyncError = null;
+      fresh.inventoryProductCount = activeCount;
+      fresh.lastInventorySyncAt = now;
+      if (platformHint) fresh.detectedPlatform = platformHint;
+      if (activeCount > 0 && !fresh.inventoryInitialSyncedAt) {
+        fresh.inventoryInitialSyncedAt = now;
+      }
+      await fresh.save();
+      console.log(
+        `[inventory] Scrape stopped for store ${fresh._id} — ${activeCount} products kept`
+      );
+
+      if (activeCount > 0) {
+        try {
+          await buildAndStoreRecommendationTaxonomy(fresh._id);
+        } catch (taxError) {
+          console.warn(`[inventory] Taxonomy rebuild after stop failed: ${taxError.message}`);
+        }
+      }
+
+      return {
+        storeId: fresh._id,
+        productCount: activeCount,
+        platform: fresh.detectedPlatform,
+        syncedAt: now,
+        stopped: true,
+        isManualRefresh: Boolean(options.isManualRefresh),
+        isInitial: Boolean(options.isInitial),
+      };
+    }
+
     console.error(`[inventory] Sync failed for store ${store._id}:`, error.message);
-    store.inventorySyncStatus = 'error';
-    store.inventorySyncError = error.message?.slice(0, 1000) || 'Inventory sync failed';
-    await store.save();
+    if (fresh) {
+      fresh.inventorySyncStatus = 'error';
+      fresh.inventorySyncError = error.message?.slice(0, 1000) || 'Inventory sync failed';
+      fresh.inventoryProductCount = activeCount;
+      await fresh.save();
+    }
     throw error;
+  } finally {
+    clearScrapeJob(store._id, controller);
   }
+}
+
+/**
+ * Force-stop an in-progress inventory scrape. Already-saved products are kept.
+ */
+export async function stopInventorySync(user) {
+  if (!user.storeId) {
+    throw new ApiError(404, 'No store associated with this account');
+  }
+
+  const store = await Store.findById(user.storeId);
+  if (!store) {
+    throw new ApiError(404, 'Store not found');
+  }
+
+  const wasActive =
+    store.inventorySyncStatus === 'syncing' || store.inventorySyncStatus === 'pending';
+  const aborted = abortScrapeJob(store._id);
+
+  if (!wasActive && !aborted) {
+    throw new ApiError(400, 'No inventory scrape is currently running');
+  }
+
+  // If the job registry missed the worker (process restart), flip status immediately
+  if (wasActive && !aborted) {
+    const activeCount = await StoreInventory.countDocuments({
+      storeId: store._id,
+      isActive: true,
+    });
+    store.inventorySyncStatus = 'stopped';
+    store.inventorySyncError = null;
+    store.inventoryProductCount = activeCount;
+    store.lastInventorySyncAt = new Date();
+    await store.save();
+  }
+
+  const status = await getAssistantStatus(user);
+  return {
+    stopped: true,
+    message: 'Scrape stop requested. Products already saved will be kept.',
+    status,
+  };
 }
 
 /**
@@ -435,6 +583,15 @@ export async function getAssistantStatus(user) {
   );
   const refreshQuota = getInventoryRefreshQuota(store);
 
+  // Live count while scraping so the dashboard updates before the job finishes
+  let inventoryProductCount = store.inventoryProductCount || 0;
+  if (store.inventorySyncStatus === 'syncing' || store.inventorySyncStatus === 'pending') {
+    inventoryProductCount = await StoreInventory.countDocuments({
+      storeId: store._id,
+      isActive: true,
+    });
+  }
+
   return {
     storeId: store._id,
     storeName: store.name,
@@ -456,7 +613,7 @@ export async function getAssistantStatus(user) {
     inventorySyncError: store.inventorySyncError,
     lastInventorySyncAt: store.lastInventorySyncAt,
     inventoryInitialSyncedAt: store.inventoryInitialSyncedAt,
-    inventoryProductCount: store.inventoryProductCount,
+    inventoryProductCount,
     recommendableProductCount: recommendable.length,
     priorityPromotionCount: priorityCount,
     inventoryRefresh: {

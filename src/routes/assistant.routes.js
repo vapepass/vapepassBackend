@@ -128,6 +128,21 @@ router.post(
 
 /**
  * @swagger
+ * /assistant/stop-inventory-sync:
+ *   post:
+ *     summary: Force-stop an in-progress inventory scrape (keeps saved products)
+ *     tags: [Assistant]
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post(
+  '/stop-inventory-sync',
+  authorizeRoles(ROLES.STORE_OWNER),
+  assistantController.stopInventorySync
+);
+
+/**
+ * @swagger
  * /assistant/inventory:
  *   get:
  *     summary: List synced inventory products for the store

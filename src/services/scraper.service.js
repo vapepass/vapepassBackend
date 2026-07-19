@@ -14,6 +14,7 @@ import {
   isCatalogProduct,
   isNonCatalogCategory,
 } from './scraper.catalog.js';
+import { assertScrapeNotAborted, ScrapeAbortedError } from './scrapeJobs.js';
 
 export {
   isELiquidCategoryName,
@@ -47,7 +48,27 @@ const BROWSER_UA =
 /** Skip ScrapingBee for the rest of the process after quota / auth failures */
 let scrapingBeeDisabled = false;
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new ScrapeAbortedError());
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new ScrapeAbortedError());
+    };
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+async function emitProductBatch(onProductBatch, batch) {
+  if (!onProductBatch || !batch?.length) return;
+  await onProductBatch(batch);
+}
 
 /**
  * Fetch with exponential backoff retries.
@@ -59,6 +80,7 @@ async function withRetry(label, fn, retries = MAX_RETRIES) {
     try {
       return await fn(attempt);
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       lastError = error;
       const status = error.status || error.statusCode;
       const clientError =
@@ -77,6 +99,7 @@ async function withRetry(label, fn, retries = MAX_RETRIES) {
         status === 429
           ? Math.max(5000, RETRY_BASE_MS * 3 * attempt)
           : RETRY_BASE_MS * 2 ** (attempt - 1);
+      if (error instanceof ScrapeAbortedError) throw error;
       await sleep(retryAfterMs);
     }
   }
@@ -346,34 +369,45 @@ function nodeHttpRequest(url, options = {}, timeoutMs = 45000) {
  * Skips only non-catalog sections (snacks, apparel, cigars, …).
  * Falls back to /products.json when no collections are usable.
  */
-export async function scrapeShopify(storeUrl) {
+export async function scrapeShopify(storeUrl, options = {}) {
+  const { signal, onProductBatch } = options;
   const origin = originOf(storeUrl);
   const products = [];
   const seen = new Set();
   const descriptionPool = new Map();
 
   console.log(`[scraper] Shopify full-inventory crawl: ${origin}`);
+  assertScrapeNotAborted(signal);
 
   let collections = [];
   try {
-    collections = await fetchShopifyCollections(origin, 40);
+    collections = await fetchShopifyCollections(origin, 40, signal);
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     console.warn(`[scraper] Shopify collections fetch failed: ${error.message}`);
   }
 
   const { targets } = await buildShopifyCatalogTargets(origin, collections);
 
-  if (!targets.length) {
-    console.warn('[scraper] No Shopify collections — falling back to /products.json');
-    return scrapeShopifyProductsJson(origin, descriptionPool);
+  // Huge collection lists (forums, brands, misc) stall crawls — prefer products.json
+  if (!targets.length || targets.length > 80) {
+    if (targets.length > 80) {
+      console.warn(
+        `[scraper] Shopify has ${targets.length} collections — using /products.json for a reliable full crawl`
+      );
+    } else {
+      console.warn('[scraper] No Shopify collections — falling back to /products.json');
+    }
+    return scrapeShopifyProductsJson(origin, descriptionPool, options);
   }
 
   console.log(`[scraper] Shopify: processing ${targets.length} collection(s)`);
 
   for (const target of targets) {
+    assertScrapeNotAborted(signal);
     if (products.length >= MAX_PRODUCTS) break;
     try {
-      await sleep(300);
+      await sleep(300, signal);
       const batch = await fetchShopifyCollectionProducts(origin, target.handle);
       console.log(
         `[scraper] Shopify "${target.category}"${
@@ -381,6 +415,7 @@ export async function scrapeShopify(storeUrl) {
         }: ${batch.length} parent products`
       );
 
+      const emitted = [];
       for (const item of batch) {
         if (item.status && item.status !== 'active') continue;
         if (!shopifyItemIsCatalogProduct(item, target)) continue;
@@ -401,9 +436,12 @@ export async function scrapeShopify(storeUrl) {
           if (!isCatalogProduct(row)) continue;
           seen.add(row.externalId);
           products.push(row);
+          emitted.push(row);
         }
       }
+      await emitProductBatch(onProductBatch, emitted);
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       console.warn(
         `[scraper] Shopify collection failed (${target.handle}): ${error.message}`
       );
@@ -413,13 +451,17 @@ export async function scrapeShopify(storeUrl) {
   // Supplement with products.json for items not in named collections
   if (products.length < 20) {
     try {
-      const flat = await scrapeShopifyProductsJson(origin, descriptionPool);
+      const flat = await scrapeShopifyProductsJson(origin, descriptionPool, options);
+      const emitted = [];
       for (const row of flat) {
         if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
         seen.add(row.externalId);
         products.push(row);
+        emitted.push(row);
       }
+      await emitProductBatch(onProductBatch, emitted);
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       console.warn(`[scraper] Shopify products.json supplement failed: ${error.message}`);
     }
   }
@@ -462,23 +504,27 @@ async function buildShopifyCatalogTargets(_origin, collections) {
   return { targets, reason: null };
 }
 
-async function scrapeShopifyProductsJson(origin, descriptionPool = new Map()) {
+async function scrapeShopifyProductsJson(origin, descriptionPool = new Map(), options = {}) {
+  const { signal, onProductBatch } = options;
   const products = [];
   const seen = new Set();
   let page = 1;
 
   while (products.length < MAX_PRODUCTS && page <= 40) {
+    assertScrapeNotAborted(signal);
     const endpoint = `${origin}/products.json?limit=250&page=${page}`;
     let data;
     try {
       data = await withRetry(`Shopify products.json p${page}`, () => fetchJson(endpoint));
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       if (page === 1) throw error;
       break;
     }
     const batch = Array.isArray(data?.products) ? data.products : [];
     if (!batch.length) break;
 
+    const emitted = [];
     for (const item of batch) {
       if (item.status && item.status !== 'active') continue;
       if (!shopifyItemIsCatalogProduct(item, {})) continue;
@@ -496,12 +542,14 @@ async function scrapeShopifyProductsJson(origin, descriptionPool = new Map()) {
         if (!isCatalogProduct(row)) continue;
         seen.add(row.externalId);
         products.push(row);
+        emitted.push(row);
       }
     }
+    await emitProductBatch(onProductBatch, emitted);
 
     if (batch.length < 250) break;
     page += 1;
-    await sleep(250);
+    await sleep(250, signal);
   }
 
   return products;
@@ -540,15 +588,17 @@ function shopifyItemBelongsToELiquid(item, target = {}) {
   return shopifyItemIsCatalogProduct(item, target);
 }
 
-async function fetchShopifyCollections(origin, maxPages = 10) {
+async function fetchShopifyCollections(origin, maxPages = 10, signal) {
   const collections = [];
   let page = 1;
   while (page <= maxPages) {
+    assertScrapeNotAborted(signal);
     const endpoint = `${origin}/collections.json?limit=250&page=${page}`;
     let data;
     try {
       data = await withRetry(`Shopify collections page ${page}`, () => fetchJson(endpoint));
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       if (page === 1) throw error;
       break;
     }
@@ -557,7 +607,7 @@ async function fetchShopifyCollections(origin, maxPages = 10) {
     collections.push(...batch);
     if (batch.length < 250) break;
     page += 1;
-    await sleep(300);
+    await sleep(300, signal);
   }
   return collections.filter((c) => c.handle && !/^frontpage$/i.test(c.handle));
 }
@@ -589,27 +639,30 @@ async function fetchShopifyCollectionProducts(origin, handle, maxPages = 20) {
 /**
  * WooCommerce crawl — full public catalog (all product categories).
  */
-export async function scrapeWooCommerce(storeUrl) {
+export async function scrapeWooCommerce(storeUrl, options = {}) {
   const origin = originOf(storeUrl);
   console.log(`[scraper] WooCommerce full-inventory crawl: ${origin}`);
+  assertScrapeNotAborted(options.signal);
 
   try {
-    const products = await scrapeWooByCategories(origin);
+    const products = await scrapeWooByCategories(origin, options);
     if (products.length) {
       console.log(`[scraper] WooCommerce category crawl: ${products.length} products`);
       return products;
     }
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     console.warn(`[scraper] Woo category crawl failed: ${error.message}`);
   }
 
   try {
-    const flat = await scrapeWooStoreApi(origin);
+    const flat = await scrapeWooStoreApi(origin, options);
     if (flat.length) {
       console.log(`[scraper] WooCommerce Store API crawl: ${flat.length} products`);
       return flat;
     }
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     console.warn(`[scraper] Woo Store API crawl failed: ${error.message}`);
   }
 
@@ -651,7 +704,9 @@ export async function scrapeWooCommerce(storeUrl) {
 /**
  * Walk the full WooCommerce category tree (every public product category).
  */
-async function scrapeWooByCategories(origin) {
+async function scrapeWooByCategories(origin, options = {}) {
+  const { signal, onProductBatch } = options;
+  assertScrapeNotAborted(signal);
   const categories = await fetchWooCategories(origin);
   if (!categories.length) return [];
 
@@ -712,6 +767,7 @@ async function scrapeWooByCategories(origin) {
   );
 
   for (const target of walkTargets) {
+    assertScrapeNotAborted(signal);
     if (products.length >= MAX_PRODUCTS) break;
     let batch = [];
     try {
@@ -722,6 +778,7 @@ async function scrapeWooByCategories(origin) {
         }: ${batch.length} parent products`
       );
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       console.warn(
         `[scraper] Woo category failed (${target.category}${
           target.subcategory ? ` → ${target.subcategory}` : ''
@@ -730,7 +787,9 @@ async function scrapeWooByCategories(origin) {
       continue;
     }
 
+    const emitted = [];
     for (const item of batch) {
+      assertScrapeNotAborted(signal);
       if (item.is_purchasable === false && item.is_in_stock === false) continue;
 
       let hydrated = item;
@@ -748,8 +807,10 @@ async function scrapeWooByCategories(origin) {
         if (!isCatalogProduct(row)) continue;
         seen.add(row.externalId);
         products.push(row);
+        emitted.push(row);
       }
     }
+    await emitProductBatch(onProductBatch, emitted);
   }
 
   return products;
@@ -843,25 +904,30 @@ async function hydrateWooProduct(origin, item) {
   return item;
 }
 
-async function scrapeWooStoreApi(origin) {
+async function scrapeWooStoreApi(origin, options = {}) {
+  const { signal, onProductBatch } = options;
   const products = [];
   const seen = new Set();
   const descriptionPool = new Map();
   let page = 1;
 
   while (products.length < MAX_PRODUCTS) {
+    assertScrapeNotAborted(signal);
     const endpoint = `${origin}/wp-json/wc/store/v1/products?per_page=100&page=${page}`;
     let batch;
     try {
       batch = await withRetry(`Woo Store API page ${page}`, () => fetchJson(endpoint));
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       if (page === 1) throw error;
       break;
     }
 
     if (!Array.isArray(batch) || !batch.length) break;
 
+    const emitted = [];
     for (const item of batch) {
+      assertScrapeNotAborted(signal);
       if (item.is_purchasable === false && item.is_in_stock === false) continue;
       if (!wooItemIsCatalogProduct(item)) continue;
 
@@ -881,8 +947,10 @@ async function scrapeWooStoreApi(origin) {
         if (!isCatalogProduct(row)) continue;
         seen.add(row.externalId);
         products.push(row);
+        emitted.push(row);
       }
     }
+    await emitProductBatch(onProductBatch, emitted);
 
     if (batch.length < 100) break;
     page += 1;
@@ -1157,29 +1225,35 @@ function escapeRegExp(value) {
 /**
  * Full store crawl: detect platform, scrape complete public inventory.
  * Skips only non-catalog sections (snacks, apparel, cigars, …).
+ * @param {string} storeWebsiteUrl
+ * @param {{ signal?: AbortSignal, onProductBatch?: (products: object[]) => Promise<void>|void }} [options]
  */
-export async function scrapeStoreProducts(storeWebsiteUrl) {
+export async function scrapeStoreProducts(storeWebsiteUrl, options = {}) {
+  const { signal, onProductBatch } = options;
   const url = normalizeStoreUrl(storeWebsiteUrl);
   console.log(`[scraper] Starting full inventory crawl for ${url}`);
+  assertScrapeNotAborted(signal);
 
   // 1) Shopify — all collections / products.json
   try {
-    const shopifyProducts = await scrapeShopify(url);
+    const shopifyProducts = await scrapeShopify(url, options);
     if (shopifyProducts.length > 0) {
       return finalizeCatalogProducts(shopifyProducts, url, 'shopify');
     }
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     if (error instanceof ApiError) throw error;
     console.warn(`[scraper] Shopify probe failed: ${error.message}`);
   }
 
   // 2) WooCommerce — full category tree / Store API
   try {
-    const wooProducts = await scrapeWooCommerceApisOnly(url);
+    const wooProducts = await scrapeWooCommerceApisOnly(url, options);
     if (wooProducts.length > 0) {
       return finalizeCatalogProducts(wooProducts, url, 'woocommerce');
     }
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     if (error instanceof ApiError) throw error;
     console.warn(`[scraper] WooCommerce API probe failed: ${error.message}`);
   }
@@ -1189,20 +1263,23 @@ export async function scrapeStoreProducts(storeWebsiteUrl) {
   let homepageHtml = '';
 
   try {
+    assertScrapeNotAborted(signal);
     homepageHtml = await fetchPageHtml(url);
     platform = detectPlatform(homepageHtml, url);
     console.log(`[scraper] Detected platform from HTML: ${platform}`);
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     console.warn(`[scraper] Homepage fetch failed: ${error.message}`);
   }
 
   if (platform === 'woocommerce' || platform === 'generic') {
     try {
-      const wooProducts = await scrapeWooCommerce(url);
+      const wooProducts = await scrapeWooCommerce(url, options);
       if (wooProducts.length > 0) {
         return finalizeCatalogProducts(wooProducts, url, 'woocommerce');
       }
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       console.warn(`[scraper] WooCommerce HTML scrape failed: ${error.message}`);
     }
   }
@@ -1224,16 +1301,21 @@ export async function scrapeStoreProducts(storeWebsiteUrl) {
   const seen = new Set();
 
   for (const path of fallbackPaths) {
+    assertScrapeNotAborted(signal);
     if (htmlProducts.length >= 80) break;
     try {
       const html = await fetchPageHtml(path);
       const parsed = parseProductsFromHtml(html, path, detectPlatform(html, path));
+      const emitted = [];
       for (const p of parsed) {
         if (!isCatalogProduct(p) || seen.has(p.externalId)) continue;
         seen.add(p.externalId);
         htmlProducts.push(p);
+        emitted.push(p);
       }
+      await emitProductBatch(onProductBatch, emitted);
     } catch (error) {
+      if (error instanceof ScrapeAbortedError) throw error;
       console.warn(`[scraper] Catalog path failed (${path}): ${error.message}`);
     }
   }
@@ -1302,23 +1384,26 @@ function finalizeELiquidProducts(products, url, platform) {
 }
 
 /** WooCommerce JSON APIs — full category tree (no e-liquid-only restriction). */
-async function scrapeWooCommerceApisOnly(storeUrl) {
+async function scrapeWooCommerceApisOnly(storeUrl, options = {}) {
   const origin = originOf(storeUrl);
+  assertScrapeNotAborted(options.signal);
 
   try {
-    const products = await scrapeWooByCategories(origin);
+    const products = await scrapeWooByCategories(origin, options);
     if (products.length) {
       console.log(`[scraper] WooCommerce category crawl: ${products.length} products`);
       return products;
     }
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     console.warn(`[scraper] Woo category crawl failed: ${error.message}`);
   }
 
   try {
-    const flat = await scrapeWooStoreApi(origin);
+    const flat = await scrapeWooStoreApi(origin, options);
     if (flat.length) return flat;
   } catch (error) {
+    if (error instanceof ScrapeAbortedError) throw error;
     console.warn(`[scraper] Woo Store API failed: ${error.message}`);
   }
 
