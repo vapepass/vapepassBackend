@@ -133,7 +133,7 @@ export function logEmailConfigStatus() {
   if (provider === 'resend' && !testingTo) {
     console.warn(
       '[email] Without a verified Resend domain, you can only send to your Resend account email. ' +
-        'Set RESEND_TESTING_TO=info@vapepass.ca for now, or verify vapepass.ca at resend.com/domains.'
+        'Set RESEND_TESTING_TO to that exact address (see Resend error message), or verify a domain at resend.com/domains.'
     );
   }
 
@@ -148,8 +148,10 @@ export function logEmailConfigStatus() {
  * Resend free/test accounts can only deliver to the account owner email until a
  * domain is verified. Optionally redirect every message to that inbox.
  */
-function applyResendTestingRedirect({ to, subject, text, html }) {
-  const testingTo = env.email.resendTestingTo;
+function applyResendTestingRedirect({ to, subject, text, html }, forceTo = null) {
+  const testingTo = String(forceTo || env.email.resendTestingTo || '')
+    .trim()
+    .toLowerCase();
   if (!hasResend() || !testingTo) {
     return { to, subject, text, html, redirected: false };
   }
@@ -158,10 +160,11 @@ function applyResendTestingRedirect({ to, subject, text, html }) {
     return { to: testingTo, subject, text, html, redirected: false };
   }
 
+  const safeTo = String(to).replace(/</g, '&lt;');
   const banner = `
     <p style="margin:0 0 20px;padding:12px 14px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;font-size:13px;color:#5b21b6;line-height:1.5;">
       <strong>Resend test mode</strong><br/>
-      Intended recipient: ${String(to).replace(/</g, '&lt;')}
+      Intended recipient: ${safeTo}
     </p>
   `;
 
@@ -172,6 +175,14 @@ function applyResendTestingRedirect({ to, subject, text, html }) {
     html: `${banner}${html || ''}`,
     redirected: true,
   };
+}
+
+/** Parse "your own email address (user@gmail.com)" from Resend errors. */
+function extractResendAllowedEmail(errorMessage) {
+  const match = String(errorMessage || '').match(
+    /your own email address\s*\(([^)]+@[^)]+)\)/i
+  );
+  return match ? match[1].trim().toLowerCase() : '';
 }
 
 async function sendViaResend({ to, subject, text, html, replyTo, from }) {
@@ -234,23 +245,27 @@ async function sendMail({ to, subject, text, html, replyTo }) {
     return { sent: false, error: 'Missing recipient' };
   }
 
-  const delivery =
+  let delivery =
     provider === 'resend'
       ? applyResendTestingRedirect({ to, subject, text, html })
       : { to, subject, text, html, redirected: false };
 
+  const attemptSend = async (payload) => {
+    if (provider === 'resend') {
+      return sendViaResend({
+        to: payload.to,
+        subject: payload.subject,
+        text: payload.text,
+        html: payload.html,
+        replyTo,
+        from,
+      });
+    }
+    return sendViaSmtp({ to, subject, text, html, replyTo, from });
+  };
+
   try {
-    const result =
-      provider === 'resend'
-        ? await sendViaResend({
-            to: delivery.to,
-            subject: delivery.subject,
-            text: delivery.text,
-            html: delivery.html,
-            replyTo,
-            from,
-          })
-        : await sendViaSmtp({ to, subject, text, html, replyTo, from });
+    const result = await attemptSend(delivery);
 
     console.info(
       `[email] Sent via ${result.provider} "${delivery.subject}" → ${delivery.to}` +
@@ -261,6 +276,34 @@ async function sendMail({ to, subject, text, html, replyTo }) {
     return result;
   } catch (error) {
     const msg = error.message || String(error);
+
+    // Auto-recover from Resend test-mode restriction by retrying to the allowed inbox.
+    if (provider === 'resend' && /only send testing emails|verify a domain/i.test(msg)) {
+      const allowed = extractResendAllowedEmail(msg);
+      if (allowed && extractEmailAddress(delivery.to) !== allowed) {
+        console.warn(
+          `[email] Resend only allows ${allowed} until a domain is verified. ` +
+            `Retrying (set RESEND_TESTING_TO=${allowed} on Railway to skip this retry).`
+        );
+        delivery = applyResendTestingRedirect({ to, subject, text, html }, allowed);
+        try {
+          const retry = await attemptSend(delivery);
+          console.info(
+            `[email] Sent via ${retry.provider} "${delivery.subject}" → ${delivery.to}` +
+              ` (auto-redirected from ${to})` +
+              (retry.messageId ? ` (id: ${retry.messageId})` : '')
+          );
+          return retry;
+        } catch (retryError) {
+          console.error(
+            `[email] sendMail retry failed → ${delivery.to}:`,
+            retryError.message || retryError
+          );
+          return { sent: false, error: retryError.message || String(retryError) };
+        }
+      }
+    }
+
     console.error(
       `[email] sendMail failed via ${provider} → ${delivery.to} ("${delivery.subject}"):`,
       msg
@@ -274,9 +317,10 @@ async function sendMail({ to, subject, text, html, replyTo }) {
     }
 
     if (/only send testing emails|verify a domain/i.test(msg)) {
+      const allowed = extractResendAllowedEmail(msg) || 'your Resend account email';
       console.error(
-        '[email] Resend test restriction: verify vapepass.ca at https://resend.com/domains ' +
-          'OR set RESEND_TESTING_TO=info@vapepass.ca so all mail is redirected to your Resend account email.'
+        `[email] Resend test restriction: set RESEND_TESTING_TO=${allowed} and SUPPORT_ADMIN_EMAIL=${allowed}, ` +
+          'or verify your domain at https://resend.com/domains and update EMAIL_FROM.'
       );
     }
 
