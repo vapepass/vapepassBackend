@@ -262,14 +262,24 @@ Set these **Environment Variables** in the Railway service (`.env` is not deploy
 | `JWT_REFRESH_SECRET` | long random string |
 | `CLIENT_URL` | `https://vapepass.vercel.app` |
 | `NODE_ENV` | `production` |
-| `SMTP_HOST` | Your SMTP host (password reset emails) |
+| `SMTP_HOST` | `smtp.gmail.com` (or your SMTP host) |
 | `SMTP_PORT` | `587` |
-| `SMTP_USER` | SMTP username |
-| `SMTP_PASS` | SMTP password |
-| `EMAIL_FROM` | `VapePass <noreply@yourdomain.com>` |
+| `SMTP_SECURE` | `false` |
+| `SMTP_USER` | Full Gmail address used for SMTP login |
+| `SMTP_PASS` | Gmail **App Password** (16 chars; spaces optional) |
+| `EMAIL_FROM` | Must match `SMTP_USER`, e.g. `VapePass <you@gmail.com>` |
+| `SUPPORT_ADMIN_EMAIL` | Inbox that receives Free Setup notifications |
 | `STRIPE_SECRET_KEY` | Stripe secret key |
 | `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret |
 | `STRIPE_PRICE_ID` | Stripe recurring price ID ($99/month) |
+
+**Email on Railway (important):**
+
+- `.env` is **not** uploaded — set every SMTP variable in the Railway dashboard.
+- `SUPPORT_ADMIN_EMAIL` is required for Free Setup admin alerts.
+- `EMAIL_FROM` must use the same address as `SMTP_USER` (Gmail rejects mismatches).
+- After deploy, check Railway logs for: `[email] SMTP configured … supportAdmin=…`
+- If Gmail blocks cloud IPs, switch to a transactional provider (Resend, SendGrid, Mailgun) or enable a Gmail App Password and allow less secure access patterns as documented by Google.
 
 **MongoDB Atlas:** In Network Access, allow `0.0.0.0/0` so Railway can connect.
 

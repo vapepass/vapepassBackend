@@ -22,7 +22,9 @@ async function dispatchSetupRequestEmails(doc) {
   };
 
   if (!adminTo) {
-    console.error('[support] SUPPORT_ADMIN_EMAIL is not configured — admin notification skipped');
+    console.error(
+      '[support] SUPPORT_ADMIN_EMAIL is not configured on this host — admin notification skipped'
+    );
   }
 
   const [customerMail, adminMail] = await Promise.all([
@@ -41,9 +43,17 @@ async function dispatchSetupRequestEmails(doc) {
 
   console.info(
     `[support] Setup request ${doc._id} emails — customer: ${
-      customerMail?.sent ? 'sent' : customerMail?.devFallback ? 'dev-fallback' : `failed (${customerMail?.error || 'unknown'})`
+      customerMail?.sent
+        ? 'sent'
+        : customerMail?.devFallback
+          ? 'dev-fallback'
+          : `failed (${customerMail?.error || 'unknown'})`
     }, admin (${adminTo || 'n/a'}): ${
-      adminMail?.sent ? 'sent' : adminMail?.devFallback ? 'dev-fallback' : `failed (${adminMail?.error || 'unknown'})`
+      adminMail?.sent
+        ? 'sent'
+        : adminMail?.devFallback
+          ? 'dev-fallback'
+          : `failed (${adminMail?.error || 'unknown'})`
     }`
   );
 
@@ -54,8 +64,19 @@ async function dispatchSetupRequestEmails(doc) {
 }
 
 /**
- * Create a free setup assistance request, persist it, and notify customer + admin.
- * Email failures are logged but do not roll back a successful save.
+ * Queue emails after the HTTP response path — do not block the client on SMTP.
+ */
+function queueSetupRequestEmails(doc) {
+  setImmediate(() => {
+    dispatchSetupRequestEmails(doc).catch((err) => {
+      console.error(`[support] Background email dispatch failed for ${doc._id}:`, err.message);
+    });
+  });
+}
+
+/**
+ * Create a free setup assistance request and return immediately after DB save.
+ * Emails are sent in the background so production SMTP latency does not freeze the UI.
  */
 export async function createSetupAssistanceRequest(payload, user) {
   const email = String(payload.email || '').trim().toLowerCase();
@@ -80,13 +101,15 @@ export async function createSetupAssistanceRequest(payload, user) {
 
   const existing = await SetupRequest.findOne(duplicateFilter);
 
-  // If a prior request exists but admin email never went out, retry notifications.
+  // Prior request exists but admin email never confirmed — retry in background.
   if (existing && !existing.adminEmailSentAt) {
-    const mailResult = await dispatchSetupRequestEmails(existing);
+    queueSetupRequestEmails(existing);
     return {
       requestId: String(existing._id),
       status: existing.status,
-      ...mailResult,
+      customerEmailSent: null,
+      adminEmailSent: null,
+      queued: true,
       resent: true,
     };
   }
@@ -117,12 +140,14 @@ export async function createSetupAssistanceRequest(payload, user) {
     status: SETUP_REQUEST_STATUS.PENDING,
   });
 
-  const mailResult = await dispatchSetupRequestEmails(doc);
+  queueSetupRequestEmails(doc);
 
   return {
     requestId: String(doc._id),
     status: doc.status,
-    ...mailResult,
+    customerEmailSent: null,
+    adminEmailSent: null,
+    queued: true,
   };
 }
 

@@ -1,6 +1,7 @@
 import app from './app.js';
 import { connectDB } from './config/db.js';
 import { env } from './config/env.js';
+import { logEmailConfigStatus } from './services/email.service.js';
 import { startInventoryCron } from './jobs/inventoryCron.js';
 import { startSubscriptionCron } from './jobs/subscriptionCron.js';
 
@@ -31,6 +32,7 @@ const startServer = async () => {
     console.log(`VapePass API running on port ${env.port}`);
     console.log(`Health check: http://0.0.0.0:${env.port}/health`);
     console.log(`Swagger docs: http://0.0.0.0:${env.port}/api-docs`);
+    logEmailConfigStatus();
   });
 
   await connectWithRetry();

@@ -42,15 +42,21 @@ export const env = {
     host: process.env.SMTP_HOST,
     port: parseInt(process.env.SMTP_PORT, 10) || 587,
     secure: process.env.SMTP_SECURE === 'true',
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-    from: process.env.EMAIL_FROM,
+    user: String(process.env.SMTP_USER || '').trim(),
+    /** Gmail app passwords are often pasted with spaces — strip them */
+    pass: String(process.env.SMTP_PASS || '').replace(/\s+/g, ''),
+    from: String(process.env.EMAIL_FROM || '')
+      .trim()
+      .replace(/^["']|["']$/g, ''),
     logoUrl: process.env.EMAIL_LOGO_URL,
     /** Inbox for Free Setup Request admin notifications */
-    supportAdmin:
+    supportAdmin: String(
       process.env.SUPPORT_ADMIN_EMAIL ||
-      process.env.ADMIN_EMAIL ||
-      'admin@vapepass.com',
+        process.env.ADMIN_EMAIL ||
+        ''
+    )
+      .trim()
+      .toLowerCase(),
   },
   openai: {
     apiKey: process.env.OPENAI_API_KEY,

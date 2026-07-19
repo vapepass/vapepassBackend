@@ -11,6 +11,7 @@ import {
 
 let transporter = null;
 let fromAddressLogged = false;
+let configLogged = false;
 
 function extractEmailAddress(value) {
   const raw = String(value || '').trim();
@@ -46,7 +47,7 @@ function resolveFromAddress() {
     }
   }
 
-  return configuredFrom || smtpUser || undefined;
+  return configuredFrom || (smtpUser ? `VapePass <${smtpUser}>` : undefined);
 }
 
 function getTransporter() {
@@ -62,6 +63,13 @@ function getTransporter() {
         env.email.user && env.email.pass
           ? { user: env.email.user, pass: env.email.pass }
           : undefined,
+      // Prevent Railway/production requests from hanging on slow SMTP
+      connectionTimeout: 12_000,
+      greetingTimeout: 12_000,
+      socketTimeout: 20_000,
+      tls: {
+        minVersion: 'TLSv1.2',
+      },
     });
   }
 
@@ -69,11 +77,40 @@ function getTransporter() {
 }
 
 export function isEmailConfigured() {
-  return Boolean(env.email.host && resolveFromAddress());
+  return Boolean(env.email.host && env.email.user && env.email.pass && resolveFromAddress());
 }
 
 export function getSupportAdminEmail() {
   return String(env.email.supportAdmin || '').trim();
+}
+
+/** Log SMTP readiness once at boot (no secrets). */
+export function logEmailConfigStatus() {
+  if (configLogged) return;
+  configLogged = true;
+
+  const configured = isEmailConfigured();
+  const admin = getSupportAdminEmail();
+
+  console.info(
+    `[email] SMTP ${configured ? 'configured' : 'NOT configured'} — ` +
+      `host=${env.email.host || 'n/a'}, port=${env.email.port}, ` +
+      `user=${env.email.user || 'n/a'}, from=${resolveFromAddress() || 'n/a'}, ` +
+      `supportAdmin=${admin || 'MISSING (set SUPPORT_ADMIN_EMAIL)'}`
+  );
+
+  if (!configured) {
+    console.warn(
+      '[email] Set SMTP_HOST, SMTP_USER, SMTP_PASS, and EMAIL_FROM on the host (Railway). ' +
+        '.env files are not deployed.'
+    );
+  }
+
+  if (!admin) {
+    console.warn(
+      '[email] SUPPORT_ADMIN_EMAIL is not set — Free Setup admin notifications will be skipped.'
+    );
+  }
 }
 
 async function sendMail({ to, subject, text, html, replyTo }) {
@@ -91,21 +128,26 @@ async function sendMail({ to, subject, text, html, replyTo }) {
     return { sent: false, error: 'Missing recipient' };
   }
 
-  const info = await transport.sendMail({
-    from,
-    to,
-    replyTo: replyTo || undefined,
-    subject,
-    text,
-    html,
-  });
+  try {
+    const info = await transport.sendMail({
+      from,
+      to,
+      replyTo: replyTo || undefined,
+      subject,
+      text,
+      html,
+    });
 
-  console.info(
-    `[email] Sent "${subject}" → ${to}` +
-      (info?.messageId ? ` (id: ${info.messageId})` : '')
-  );
+    console.info(
+      `[email] Sent "${subject}" → ${to}` +
+        (info?.messageId ? ` (id: ${info.messageId})` : '')
+    );
 
-  return { sent: true, messageId: info?.messageId };
+    return { sent: true, messageId: info?.messageId };
+  } catch (error) {
+    console.error(`[email] sendMail failed → ${to} ("${subject}"):`, error.message);
+    return { sent: false, error: error.message };
+  }
 }
 
 /**
@@ -122,18 +164,17 @@ export async function sendPasswordResetEmail(to, resetToken) {
     return { sent: false, devFallback: true };
   }
 
-  try {
-    return await sendMail({
-      to,
-      subject: 'Reset your VapePass password',
-      text: [
-        'You requested a password reset for your VapePass account.',
-        '',
-        `Reset your password: ${resetUrl}`,
-        '',
-        'This link expires in 1 hour. If you did not request this, you can ignore this email.',
-      ].join('\n'),
-      html: `
+  return sendMail({
+    to,
+    subject: 'Reset your VapePass password',
+    text: [
+      'You requested a password reset for your VapePass account.',
+      '',
+      `Reset your password: ${resetUrl}`,
+      '',
+      'This link expires in 1 hour. If you did not request this, you can ignore this email.',
+    ].join('\n'),
+    html: `
       <div style="font-family:Inter,system-ui,sans-serif;max-width:480px;margin:0 auto;padding:24px;">
         <h2 style="color:#0c0c12;margin:0 0 12px;">Reset your password</h2>
         <p style="color:#5c5c6d;line-height:1.6;">You requested a password reset for your VapePass account. Click the button below to choose a new password.</p>
@@ -143,74 +184,40 @@ export async function sendPasswordResetEmail(to, resetToken) {
         <p style="color:#9494a6;font-size:13px;line-height:1.5;">This link expires in 1 hour. If you did not request this, you can safely ignore this email.</p>
       </div>
     `,
-    });
-  } catch (error) {
-    console.error(`[email] Failed password reset email to ${to}:`, error.message);
-    return { sent: false, error: error.message };
-  }
+  });
 }
 
 export async function sendSubscriptionActivatedEmail(to, payload) {
   const email = buildSubscriptionActivatedEmail(payload);
-  try {
-    return await sendMail({ to, ...email });
-  } catch (error) {
-    console.error(`[email] Failed subscription activated email to ${to}:`, error.message);
-    return { sent: false, error: error.message };
-  }
+  return sendMail({ to, ...email });
 }
 
 export async function sendRenewalReminderEmail(to, payload) {
   const email = buildRenewalReminderEmail(payload);
-  try {
-    return await sendMail({ to, ...email });
-  } catch (error) {
-    console.error(`[email] Failed renewal reminder to ${to}:`, error.message);
-    return { sent: false, error: error.message };
-  }
+  return sendMail({ to, ...email });
 }
 
 export async function sendPaymentFailedEmail(to, payload) {
   const email = buildPaymentFailedEmail(payload);
-  try {
-    return await sendMail({ to, ...email });
-  } catch (error) {
-    console.error(`[email] Failed payment-failed email to ${to}:`, error.message);
-    return { sent: false, error: error.message };
-  }
+  return sendMail({ to, ...email });
 }
 
 export async function sendSubscriptionPausedEmail(to, payload) {
   const email = buildSubscriptionPausedEmail(payload);
-  try {
-    return await sendMail({ to, ...email });
-  } catch (error) {
-    console.error(`[email] Failed subscription paused email to ${to}:`, error.message);
-    return { sent: false, error: error.message };
-  }
+  return sendMail({ to, ...email });
 }
 
 export async function sendSetupRequestCustomerEmail(to, payload) {
   const email = buildSetupRequestCustomerEmail(payload);
-  try {
-    return await sendMail({ to, ...email });
-  } catch (error) {
-    console.error(`[email] Failed setup-request customer email to ${to}:`, error.message);
-    return { sent: false, error: error.message };
-  }
+  return sendMail({ to, ...email });
 }
 
 export async function sendSetupRequestAdminEmail(to, payload) {
   const email = buildSetupRequestAdminEmail(payload);
-  try {
-    console.info(`[email] Sending admin setup notification → ${to}`);
-    return await sendMail({
-      to,
-      ...email,
-      replyTo: payload.email || undefined,
-    });
-  } catch (error) {
-    console.error(`[email] Failed setup-request admin email to ${to}:`, error.message);
-    return { sent: false, error: error.message };
-  }
+  console.info(`[email] Sending admin setup notification → ${to}`);
+  return sendMail({
+    to,
+    ...email,
+    replyTo: payload.email || undefined,
+  });
 }
