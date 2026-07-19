@@ -37,6 +37,7 @@ function compactProduct(p) {
     variant: p.variantName || undefined,
     nicotine: p.nicotineStrength || (p.nicotineMgMl != null ? `${p.nicotineMgMl}mg` : undefined),
     size: p.bottleSize || (p.volumeMl != null ? `${p.volumeMl}mL` : undefined),
+    productType: p.productType || undefined,
     description: p.description ? String(p.description).slice(0, DESC_SNIPPET) : undefined,
     priority: p.isPriorityPromotion ? true : undefined,
   };
@@ -64,7 +65,8 @@ function sampleProductsForPrompt(products, limit = MAX_PRODUCTS_IN_PROMPT) {
 
 /**
  * Heuristic fallback taxonomy when OpenAI is unavailable.
- * Still dynamic from inventory fields — not a fixed flavor list.
+ * First step = inventory type / category present in this store (dynamic).
+ * Flavor/ice refinements only under liquid-like branches.
  */
 export function buildHeuristicTaxonomy(products = []) {
   const byId = products.map((p) => String(p._id));
@@ -84,7 +86,13 @@ export function buildHeuristicTaxonomy(products = []) {
 
   const categoryMap = new Map();
   for (const p of products) {
-    const key = (p.category || p.subcategory || p.flavor || p.brand || 'All products').trim();
+    const key = (
+      p.category ||
+      inventoryTypeLabel(p) ||
+      p.subcategory ||
+      p.brand ||
+      'All products'
+    ).trim();
     if (!categoryMap.has(key)) categoryMap.set(key, []);
     categoryMap.get(key).push(String(p._id));
   }
@@ -104,20 +112,25 @@ export function buildHeuristicTaxonomy(products = []) {
     let nextStepId = null;
 
     const subset = products.filter((p) => ids.includes(String(p._id)));
-    const iceGroups = partitionByIce(subset);
-    if (iceGroups.length >= 2 && subset.length >= 4) {
-      nextStepId = `step_${optionId}_refine`;
-      steps[nextStepId] = {
-        id: nextStepId,
-        prompt: 'Which style do you prefer?',
-        options: iceGroups.map((g, idx) => ({
-          id: `${optionId}_g${idx}`,
-          label: g.label,
-          emoji: g.emoji,
-          productIds: g.ids,
-          nextStepId: null,
-        })),
-      };
+    const liquidLike = subset.some((p) => isLiquidLikeProduct(p));
+
+    // Only offer ice/flavor refine for e-liquid / disposable / pouch style sets
+    if (liquidLike) {
+      const iceGroups = partitionByIce(subset);
+      if (iceGroups.length >= 2 && subset.length >= 4) {
+        nextStepId = `step_${optionId}_refine`;
+        steps[nextStepId] = {
+          id: nextStepId,
+          prompt: 'Which style do you prefer?',
+          options: iceGroups.map((g, idx) => ({
+            id: `${optionId}_g${idx}`,
+            label: g.label,
+            emoji: g.emoji,
+            productIds: g.ids,
+            nextStepId: null,
+          })),
+        };
+      }
     }
 
     options.push({
@@ -131,11 +144,38 @@ export function buildHeuristicTaxonomy(products = []) {
 
   steps[entryId] = {
     id: entryId,
-    prompt: 'What are you in the mood for?',
+    prompt:
+      limited.length > 1
+        ? 'What type of product are you looking for?'
+        : 'What are you in the mood for?',
     options,
   };
 
   return { version: 1, source: 'heuristic', entryStepId: entryId, steps };
+}
+
+function inventoryTypeLabel(product) {
+  const type = String(product?.productType || '').toLowerCase();
+  const map = {
+    e_liquid: 'E-Liquids',
+    disposable: 'Disposable Vapes',
+    device: 'Vape Kits & Devices',
+    pod: 'Pod Systems',
+    prefilled: 'Prefilled Pods',
+    cartridge: 'Cartridges',
+    coil: 'Coils',
+    battery: 'Batteries',
+    accessory: 'Accessories',
+    pouch: 'Nicotine Pouches',
+  };
+  return map[type] || null;
+}
+
+function isLiquidLikeProduct(product) {
+  const type = String(product?.productType || '').toLowerCase();
+  if (['e_liquid', 'disposable', 'pouch', 'prefilled', 'pod'].includes(type)) return true;
+  const hay = `${product?.category || ''} ${product?.name || ''}`.toLowerCase();
+  return /\b(e[\s_-]?liquid|e[\s_-]?juice|disposables?|pouches?|flavor|flavour)\b/i.test(hay);
 }
 
 function partitionByIce(products) {
@@ -154,6 +194,13 @@ function partitionByIce(products) {
 
 function guessEmoji(label) {
   const t = label.toLowerCase();
+  if (/disposables?|puff/.test(t)) return '🔋';
+  if (/device|kit|mod|hardware/.test(t)) return '📱';
+  if (/pod|cartridge/.test(t)) return '🧩';
+  if (/coil/.test(t)) return '🔧';
+  if (/batter/.test(t)) return '⚡';
+  if (/chargers?|accessories|tank|glass/.test(t)) return '🛠️';
+  if (/pouch/.test(t)) return '📦';
   if (/fruit|berry|mango|strawberry|citrus/.test(t)) return '🍓';
   if (/mint|menthol|ice|cool/.test(t)) return '🧊';
   if (/dessert|cream|sweet|candy|cake/.test(t)) return '🍰';
@@ -284,8 +331,12 @@ Analyze the store inventory and build a dynamic multi-step selection funnel.
 
 Rules:
 - Do NOT use a fixed universal category list. Derive categories from THIS inventory only.
+- When the inventory spans multiple product types (e-liquids, disposables, devices, pods, accessories, pouches, etc.), the FIRST step MUST ask what type of product / inventory the customer wants.
+- Later steps may refine by brand, flavor, ice/cooling, nicotine, or other attributes relevant to the chosen type.
+- Do not assume every customer wants e-liquids or flavors.
 - Adapt depth to inventory size: small catalogs may need 1–2 steps; large catalogs may need more.
 - Every option must include productIds that exist in the inventory id list.
+- Prefer PRIORITY products (priority:true) when building option productIds.
 - Keep productIds lists compact (max 25 ids per option) — pick representative matches.
 - Never create empty options.
 - Keep JSON SMALL and VALID. Prefer fewer steps over incomplete JSON.
@@ -293,7 +344,7 @@ Rules:
 
   const user = {
     instruction:
-      'Build a compact recommendation hierarchy. Return JSON with entryStepId and steps map. Keep response short.',
+      'Build a compact recommendation hierarchy. First question should determine inventory type when multiple types exist. Return JSON with entryStepId and steps map. Keep response short.',
     schema: {
       entryStepId: 'string',
       steps: {

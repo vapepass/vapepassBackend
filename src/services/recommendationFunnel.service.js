@@ -608,7 +608,7 @@ export async function beginFunnel(store, session) {
       path: [],
     };
     const reply =
-      "Thanks for confirming. Tell me what flavors you like and I'll recommend from our current inventory.";
+      "Thanks for confirming. Tell me what you're looking for — e-liquids, disposables, devices, accessories, or anything else in our inventory — and I'll help you find a match.";
     return {
       reply,
       replyType: 'text',

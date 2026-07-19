@@ -11,12 +11,16 @@ import {
   isELiquidCategoryName,
   isExcludedNonELiquidCategory,
   isLikelyELiquidProduct,
+  isCatalogProduct,
+  isNonCatalogCategory,
 } from './scraper.catalog.js';
 
 export {
   isELiquidCategoryName,
   isExcludedNonELiquidCategory,
   isLikelyELiquidProduct,
+  isCatalogProduct,
+  isNonCatalogCategory,
 } from './scraper.catalog.js';
 
 // Prefer IPv4 — avoids ConnectTimeoutError on some Windows/network setups
@@ -338,11 +342,9 @@ function nodeHttpRequest(url, options = {}, timeoutMs = 45000) {
 }
 
 /**
- * Intelligent Shopify crawl — E-Liquids section only:
- * 1) Locate E-Liquids collection(s) by name (E-Liquid, E-Juice, Freebase E-Liquid, …)
- * 2) Scrape each matching collection (products + variants)
- * 3) Never scrape Tobacco, Cigars, Disposables, Devices, Snacks, or other sections
- * 4) If no E-Liquids collection exists → return empty (caller raises a clear error)
+ * Shopify crawl — full public catalog (all collections).
+ * Skips only non-catalog sections (snacks, apparel, cigars, …).
+ * Falls back to /products.json when no collections are usable.
  */
 export async function scrapeShopify(storeUrl) {
   const origin = originOf(storeUrl);
@@ -350,7 +352,7 @@ export async function scrapeShopify(storeUrl) {
   const seen = new Set();
   const descriptionPool = new Map();
 
-  console.log(`[scraper] Shopify E-Liquids-only crawl: ${origin}`);
+  console.log(`[scraper] Shopify full-inventory crawl: ${origin}`);
 
   let collections = [];
   try {
@@ -359,18 +361,14 @@ export async function scrapeShopify(storeUrl) {
     console.warn(`[scraper] Shopify collections fetch failed: ${error.message}`);
   }
 
-  const { targets, reason } = await buildShopifyELiquidTargets(origin, collections);
+  const { targets } = await buildShopifyCatalogTargets(origin, collections);
 
   if (!targets.length) {
-    console.warn(
-      `[scraper] No E-Liquids collection found on Shopify store (${reason || 'none'})`
-    );
-    return [];
+    console.warn('[scraper] No Shopify collections — falling back to /products.json');
+    return scrapeShopifyProductsJson(origin, descriptionPool);
   }
 
-  console.log(
-    `[scraper] Shopify: processing ${targets.length} E-Liquids collection(s) only`
-  );
+  console.log(`[scraper] Shopify: processing ${targets.length} collection(s)`);
 
   for (const target of targets) {
     if (products.length >= MAX_PRODUCTS) break;
@@ -385,7 +383,7 @@ export async function scrapeShopify(storeUrl) {
 
       for (const item of batch) {
         if (item.status && item.status !== 'active') continue;
-        if (!shopifyItemBelongsToELiquid(item, target)) continue;
+        if (!shopifyItemIsCatalogProduct(item, target)) continue;
 
         const exploded = explodeShopifyProduct(
           item,
@@ -400,42 +398,49 @@ export async function scrapeShopify(storeUrl) {
         );
         for (const row of exploded) {
           if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
+          if (!isCatalogProduct(row)) continue;
           seen.add(row.externalId);
           products.push(row);
         }
       }
     } catch (error) {
       console.warn(
-        `[scraper] Shopify E-Liquids target failed (${target.handle}): ${error.message}`
+        `[scraper] Shopify collection failed (${target.handle}): ${error.message}`
       );
     }
   }
 
-  console.log(
-    `[scraper] Shopify: ${products.length} E-Liquid variant-level products from ${origin}`
-  );
+  // Supplement with products.json for items not in named collections
+  if (products.length < 20) {
+    try {
+      const flat = await scrapeShopifyProductsJson(origin, descriptionPool);
+      for (const row of flat) {
+        if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
+        seen.add(row.externalId);
+        products.push(row);
+      }
+    } catch (error) {
+      console.warn(`[scraper] Shopify products.json supplement failed: ${error.message}`);
+    }
+  }
+
+  console.log(`[scraper] Shopify: ${products.length} catalog products from ${origin}`);
   return products;
 }
 
 /**
- * Build scrape targets for the E-Liquids section only.
- *
- * Shopify collections are flat. Only collections whose title/handle match
- * E-Liquids naming (E-Liquid, E-Juice, Vape Juice, Salt Nic E-Liquid, …)
- * are scraped. Unrelated collections are never added as "subcategories".
+ * Build scrape targets for the full store catalog from Shopify collections.
  */
-async function buildShopifyELiquidTargets(_origin, collections) {
+async function buildShopifyCatalogTargets(_origin, collections) {
   const roots = collections.filter((c) => {
     const title = c.title || c.handle || '';
     if (!isValidShopifyCollectionHandle(c.handle)) return false;
-    if (isExcludedNonELiquidCategory(title) || isExcludedNonELiquidCategory(c.handle)) {
-      return false;
-    }
-    return isELiquidCategoryName(title);
+    if (isNonCatalogCategory(title) || isNonCatalogCategory(c.handle)) return false;
+    return true;
   });
 
   if (!roots.length) {
-    return { targets: [], reason: 'no_eliquid_collection' };
+    return { targets: [], reason: 'no_collections' };
   }
 
   const targets = [];
@@ -447,7 +452,7 @@ async function buildShopifyELiquidTargets(_origin, collections) {
     seenHandles.add(key);
     targets.push({
       handle: root.handle,
-      category: cleanText(root.title || root.handle || 'E-Liquids'),
+      category: cleanText(root.title || root.handle || 'Products'),
       subcategory: null,
       categoryDescription: cleanDescription(root.body_html || ''),
       subcategoryDescription: null,
@@ -457,41 +462,82 @@ async function buildShopifyELiquidTargets(_origin, collections) {
   return { targets, reason: null };
 }
 
+async function scrapeShopifyProductsJson(origin, descriptionPool = new Map()) {
+  const products = [];
+  const seen = new Set();
+  let page = 1;
+
+  while (products.length < MAX_PRODUCTS && page <= 40) {
+    const endpoint = `${origin}/products.json?limit=250&page=${page}`;
+    let data;
+    try {
+      data = await withRetry(`Shopify products.json p${page}`, () => fetchJson(endpoint));
+    } catch (error) {
+      if (page === 1) throw error;
+      break;
+    }
+    const batch = Array.isArray(data?.products) ? data.products : [];
+    if (!batch.length) break;
+
+    for (const item of batch) {
+      if (item.status && item.status !== 'active') continue;
+      if (!shopifyItemIsCatalogProduct(item, {})) continue;
+      const exploded = explodeShopifyProduct(
+        item,
+        origin,
+        {
+          category: item.product_type || 'Products',
+          subcategory: null,
+        },
+        descriptionPool
+      );
+      for (const row of exploded) {
+        if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
+        if (!isCatalogProduct(row)) continue;
+        seen.add(row.externalId);
+        products.push(row);
+      }
+    }
+
+    if (batch.length < 250) break;
+    page += 1;
+    await sleep(250);
+  }
+
+  return products;
+}
+
 /** Shopify handles are slug-like; reject feed suffixes (.atom, .oembed) and junk. */
 function isValidShopifyCollectionHandle(handle) {
   const h = String(handle || '').trim();
   if (!h || h.length > 120) return false;
   if (/\./.test(h)) return false;
-  if (/^(all|frontpage)$/i.test(h)) return false;
+  if (/^(frontpage)$/i.test(h)) return false;
   return /^[a-z0-9][a-z0-9-]*$/i.test(h);
 }
 
 const BOTTLE_HINT_RE_LOCAL = /\b(e[- ]?liquid|e[- ]?juice|refill|bottle|salt\s*nic|freebase|nic\s*salt)\b/i;
 
-function shopifyItemBelongsToELiquid(item, target = {}) {
+function shopifyItemIsCatalogProduct(item, target = {}) {
   const productType = item.product_type || '';
   const tags = String(item.tags || '');
   const title = item.title || '';
-  const haystack = `${productType} ${tags} ${title}`;
 
-  // Hard reject tobacco / hardware / snacks even if they appear inside an E-Liquids collection
-  if (isExcludedNonELiquidCategory(productType)) return false;
-  if (isExcludedNonELiquidCategory(title) && !BOTTLE_HINT_RE_LOCAL.test(haystack)) return false;
+  if (isNonCatalogCategory(productType)) return false;
+  if (isNonCatalogCategory(title) && !target.category) return false;
 
   const excludedTag = String(tags)
     .split(',')
     .map((t) => t.trim())
-    .find((t) => t && isExcludedNonELiquidCategory(t) && !isELiquidCategoryName(t));
-  if (excludedTag && !isELiquidCategoryName(productType) && !BOTTLE_HINT_RE_LOCAL.test(title)) {
-    return false;
-  }
+    .find((t) => t && isNonCatalogCategory(t));
+  if (excludedTag && isNonCatalogCategory(productType)) return false;
 
-  // Inside an explicit E-Liquids collection target — trust membership after hard rejects
-  if (target.category && isELiquidCategoryName(target.category)) {
-    return true;
-  }
+  return true;
+}
 
-  return isELiquidCategoryName(productType) || BOTTLE_HINT_RE_LOCAL.test(haystack);
+/** @deprecated Use shopifyItemIsCatalogProduct */
+function shopifyItemBelongsToELiquid(item, target = {}) {
+  return shopifyItemIsCatalogProduct(item, target);
 }
 
 async function fetchShopifyCollections(origin, maxPages = 10) {
@@ -541,31 +587,40 @@ async function fetchShopifyCollectionProducts(origin, handle, maxPages = 20) {
 }
 
 /**
- * Intelligent WooCommerce crawl — E-Liquids section only.
- * Stops if no E-Liquids category exists (no flat-catalog / shop-wide fallback).
+ * WooCommerce crawl — full public catalog (all product categories).
  */
 export async function scrapeWooCommerce(storeUrl) {
   const origin = originOf(storeUrl);
-  console.log(`[scraper] WooCommerce E-Liquids-only crawl: ${origin}`);
+  console.log(`[scraper] WooCommerce full-inventory crawl: ${origin}`);
 
   try {
     const products = await scrapeWooByCategories(origin);
     if (products.length) {
-      console.log(`[scraper] WooCommerce E-Liquids category crawl: ${products.length} products`);
+      console.log(`[scraper] WooCommerce category crawl: ${products.length} products`);
       return products;
     }
   } catch (error) {
-    console.warn(`[scraper] Woo E-Liquids category crawl failed: ${error.message}`);
+    console.warn(`[scraper] Woo category crawl failed: ${error.message}`);
   }
 
-  // HTML — E-Liquids category paths only (never /shop or full catalog)
+  try {
+    const flat = await scrapeWooStoreApi(origin);
+    if (flat.length) {
+      console.log(`[scraper] WooCommerce Store API crawl: ${flat.length} products`);
+      return flat;
+    }
+  } catch (error) {
+    console.warn(`[scraper] Woo Store API crawl failed: ${error.message}`);
+  }
+
+  // HTML fallback — category paths + shop
   const shopPaths = [
+    `${origin}/shop/`,
+    `${origin}/products/`,
     `${origin}/product-category/e-liquids/`,
-    `${origin}/product-category/e-liquid/`,
-    `${origin}/product-category/e-juice/`,
-    `${origin}/product-category/e-juices/`,
-    `${origin}/product-category/vape-juice/`,
-    `${origin}/product-category/vape-liquid/`,
+    `${origin}/product-category/disposables/`,
+    `${origin}/product-category/devices/`,
+    `${origin}/product-category/accessories/`,
   ];
 
   const seen = new Set();
@@ -577,27 +632,24 @@ export async function scrapeWooCommerce(storeUrl) {
       const html = await fetchPageHtml(path);
       const parsed = parseProductsFromHtml(html, path, 'woocommerce');
       for (const p of parsed) {
-        p.category = p.category || 'E-Liquids';
-        if (!isLikelyELiquidProduct(p)) continue;
+        if (!isCatalogProduct(p)) continue;
         if (seen.has(p.externalId)) continue;
         seen.add(p.externalId);
         products.push(p);
       }
-      await enrichHtmlProducts(products, descriptionPool, 25);
-      if (products.length >= 30) break;
+      await enrichHtmlProducts(products, descriptionPool, 40);
+      if (products.length >= 50) break;
     } catch (error) {
       console.warn(`[scraper] Woo HTML path failed (${path}): ${error.message}`);
     }
   }
 
-  console.log(`[scraper] WooCommerce HTML (E-Liquids): ${products.length} products from ${origin}`);
+  console.log(`[scraper] WooCommerce HTML: ${products.length} products from ${origin}`);
   return products;
 }
 
 /**
- * Walk only the E-Liquids category tree:
- * - If subcategories exist → process each subcategory (products + variants)
- * - If none → scrape products directly from the E-Liquids category
+ * Walk the full WooCommerce category tree (every public product category).
  */
 async function scrapeWooByCategories(origin) {
   const categories = await fetchWooCategories(origin);
@@ -606,40 +658,42 @@ async function scrapeWooByCategories(origin) {
   const byId = new Map(categories.map((c) => [c.id, c]));
   const childrenOf = (parentId) => categories.filter((c) => c.parent === parentId);
 
-  const eLiquidRoots = categories.filter((c) => {
-    if (!isELiquidCategoryName(c.name)) return false;
-    // Prefer top-most E-Liquids nodes (skip if parent is also E-Liquids)
-    const parent = c.parent ? byId.get(c.parent) : null;
-    if (parent && isELiquidCategoryName(parent.name)) return false;
+  // Top-level catalog categories (skip non-catalog roots)
+  const roots = categories.filter((c) => {
+    if (c.parent) return false;
+    if (isNonCatalogCategory(c.name)) return false;
     return true;
   });
 
-  if (!eLiquidRoots.length) {
-    console.warn('[scraper] No E-Liquids category found on WooCommerce store');
-    return [];
+  if (!roots.length) {
+    // Fall back to any non-excluded category as a root
+    const any = categories.filter((c) => !isNonCatalogCategory(c.name));
+    if (!any.length) {
+      console.warn('[scraper] No catalog categories found on WooCommerce store');
+      return [];
+    }
   }
 
   const products = [];
   const seen = new Set();
   const descriptionPool = new Map();
   const walkTargets = [];
+  const rootList = roots.length
+    ? roots
+    : categories.filter((c) => !c.parent && !isNonCatalogCategory(c.name));
 
-  for (const root of eLiquidRoots) {
+  for (const root of rootList) {
     const descendants = collectWooDescendants(root.id, childrenOf);
-    const usableKids = descendants.filter(
-      (kid) => !isExcludedNonELiquidCategory(kid.name) || isELiquidCategoryName(kid.name)
-    );
+    const usableKids = descendants.filter((kid) => !isNonCatalogCategory(kid.name));
 
     if (usableKids.length) {
       for (const kid of usableKids) {
-        const parent = kid.parent ? byId.get(kid.parent) : null;
         walkTargets.push({
           category: cleanText(root.name),
           subcategory: cleanText(kid.name),
           categoryId: kid.id,
           categoryDescription: cleanDescription(root.description),
           subcategoryDescription: cleanDescription(kid.description),
-          parentName: parent?.name || root.name,
         });
       }
     } else {
@@ -654,7 +708,7 @@ async function scrapeWooByCategories(origin) {
   }
 
   console.log(
-    `[scraper] Woo E-Liquids: ${eLiquidRoots.length} root(s), ${walkTargets.length} scrape target(s)`
+    `[scraper] Woo catalog: ${rootList.length} root(s), ${walkTargets.length} scrape target(s)`
   );
 
   for (const target of walkTargets) {
@@ -669,7 +723,7 @@ async function scrapeWooByCategories(origin) {
       );
     } catch (error) {
       console.warn(
-        `[scraper] Woo subcategory failed (${target.category}${
+        `[scraper] Woo category failed (${target.category}${
           target.subcategory ? ` → ${target.subcategory}` : ''
         }): ${error.message}`
       );
@@ -679,7 +733,6 @@ async function scrapeWooByCategories(origin) {
     for (const item of batch) {
       if (item.is_purchasable === false && item.is_in_stock === false) continue;
 
-      // Hydrate variations for variable products
       let hydrated = item;
       if (item.type === 'variable' || (Array.isArray(item.variations) && item.variations.length)) {
         try {
@@ -692,8 +745,7 @@ async function scrapeWooByCategories(origin) {
       const exploded = explodeWooProduct(hydrated, origin, target, descriptionPool);
       for (const row of exploded) {
         if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
-        // Enforce E-Liquids restriction even if a miscategorized item appears
-        if (!isLikelyELiquidProduct(row) && !isELiquidCategoryName(target.category)) continue;
+        if (!isCatalogProduct(row)) continue;
         seen.add(row.externalId);
         products.push(row);
       }
@@ -811,7 +863,7 @@ async function scrapeWooStoreApi(origin) {
 
     for (const item of batch) {
       if (item.is_purchasable === false && item.is_in_stock === false) continue;
-      if (!wooItemBelongsToELiquid(item)) continue;
+      if (!wooItemIsCatalogProduct(item)) continue;
 
       let hydrated = item;
       if (item.type === 'variable') {
@@ -822,11 +874,11 @@ async function scrapeWooStoreApi(origin) {
         }
       }
 
-      const taxonomy = wooELiquidTaxonomyFromItem(item);
+      const taxonomy = wooTaxonomyFromItem(item);
       const exploded = explodeWooProduct(hydrated, origin, taxonomy, descriptionPool);
       for (const row of exploded) {
         if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
-        if (!isLikelyELiquidProduct(row)) continue;
+        if (!isCatalogProduct(row)) continue;
         seen.add(row.externalId);
         products.push(row);
       }
@@ -839,30 +891,34 @@ async function scrapeWooStoreApi(origin) {
   return products;
 }
 
-function wooItemBelongsToELiquid(item) {
+function wooItemIsCatalogProduct(item) {
   const cats = Array.isArray(item.categories) ? item.categories : [];
   const catNames = cats.map((c) => c.name || c.label || '').filter(Boolean);
-  if (catNames.some(isELiquidCategoryName)) return true;
-  if (catNames.some(isExcludedNonELiquidCategory) && !catNames.some(isELiquidCategoryName)) {
+  if (catNames.some(isNonCatalogCategory) && !catNames.some((n) => !isNonCatalogCategory(n))) {
     return false;
   }
-  const title = item.name || item.title?.rendered || item.title || '';
-  const desc = item.description || item.short_description || '';
-  return BOTTLE_HINT_RE_LOCAL.test(`${title} ${desc}`);
+  return true;
 }
 
-function wooELiquidTaxonomyFromItem(item) {
+function wooTaxonomyFromItem(item) {
   const cats = Array.isArray(item.categories) ? item.categories : [];
   const names = cats.map((c) => c.name || c.label || '').filter(Boolean);
-  const eRoot = names.find(isELiquidCategoryName) || 'E-Liquids';
-  const sub =
-    names.find((n) => n !== eRoot && !isExcludedNonELiquidCategory(n)) ||
-    names.find((n) => n !== eRoot) ||
-    null;
+  const root = names.find((n) => !isNonCatalogCategory(n)) || names[0] || 'Products';
+  const sub = names.find((n) => n !== root && !isNonCatalogCategory(n)) || null;
   return {
-    category: cleanText(eRoot),
-    subcategory: sub && !isELiquidCategoryName(sub) ? cleanText(sub) : null,
+    category: cleanText(root),
+    subcategory: sub ? cleanText(sub) : null,
   };
+}
+
+/** @deprecated */
+function wooItemBelongsToELiquid(item) {
+  return wooItemIsCatalogProduct(item);
+}
+
+/** @deprecated */
+function wooELiquidTaxonomyFromItem(item) {
+  return wooTaxonomyFromItem(item);
 }
 
 async function scrapeWpProducts(origin) {
@@ -886,7 +942,12 @@ async function scrapeWpProducts(origin) {
     for (const item of batch) {
       const title = item.title?.rendered || item.title || '';
       const content = item.content?.rendered || item.excerpt?.rendered || '';
-      if (!BOTTLE_HINT_RE_LOCAL.test(`${title} ${content}`) && !isELiquidCategoryName(title)) {
+      const rowProbe = {
+        name: title,
+        category: null,
+        description: content,
+      };
+      if (!isCatalogProduct(rowProbe) && isNonCatalogCategory(title)) {
         continue;
       }
 
@@ -898,12 +959,12 @@ async function scrapeWpProducts(origin) {
           description: content,
         },
         origin,
-        { category: 'E-Liquids', subcategory: null },
+        { category: 'Products', subcategory: null },
         descriptionPool
       );
       for (const row of exploded) {
         if (seen.has(row.externalId) || products.length >= MAX_PRODUCTS) continue;
-        if (!isLikelyELiquidProduct(row)) continue;
+        if (!isCatalogProduct(row)) continue;
         seen.add(row.externalId);
         products.push(row);
       }
@@ -1094,53 +1155,36 @@ function escapeRegExp(value) {
 }
 
 /**
- * Full store crawl: detect platform, scrape E-Liquids products only.
- * Never crawls Devices, Tobacco, Cigars, Disposables, Pods, CBD, Snacks, etc.
- * If no E-Liquids category exists, raises a clear error and stops.
+ * Full store crawl: detect platform, scrape complete public inventory.
+ * Skips only non-catalog sections (snacks, apparel, cigars, …).
  */
 export async function scrapeStoreProducts(storeWebsiteUrl) {
   const url = normalizeStoreUrl(storeWebsiteUrl);
-  console.log(`[scraper] Starting E-Liquids inventory crawl for ${url}`);
+  console.log(`[scraper] Starting full inventory crawl for ${url}`);
 
-  // 1) Shopify — E-Liquids collections only
+  // 1) Shopify — all collections / products.json
   try {
     const shopifyProducts = await scrapeShopify(url);
     if (shopifyProducts.length > 0) {
-      return finalizeELiquidProducts(shopifyProducts, url, 'shopify');
-    }
-    // Collections loaded but none are E-Liquids → stop (do not crawl other sections)
-    const origin = originOf(url);
-    try {
-      const collections = await fetchShopifyCollections(origin, 5);
-      if (
-        collections.length &&
-        !collections.some((c) => isELiquidCategoryName(c.title || c.handle))
-      ) {
-        throw new ApiError(
-          422,
-          'No E-Liquids category found on this store. The scraper only collects E-Liquids / E-Juice / Vape Juice products. Add a public E-Liquids collection and try again.'
-        );
-      }
-    } catch (error) {
-      if (error instanceof ApiError) throw error;
+      return finalizeCatalogProducts(shopifyProducts, url, 'shopify');
     }
   } catch (error) {
     if (error instanceof ApiError) throw error;
     console.warn(`[scraper] Shopify probe failed: ${error.message}`);
   }
 
-  // 2) WooCommerce — E-Liquids category tree only
+  // 2) WooCommerce — full category tree / Store API
   try {
     const wooProducts = await scrapeWooCommerceApisOnly(url);
     if (wooProducts.length > 0) {
-      return finalizeELiquidProducts(wooProducts, url, 'woocommerce');
+      return finalizeCatalogProducts(wooProducts, url, 'woocommerce');
     }
   } catch (error) {
     if (error instanceof ApiError) throw error;
     console.warn(`[scraper] WooCommerce API probe failed: ${error.message}`);
   }
 
-  // 3) HTML — E-Liquids paths only (never full shop / all products)
+  // 3) HTML — catalog paths + discovered category links
   let platform = 'generic';
   let homepageHtml = '';
 
@@ -1156,65 +1200,57 @@ export async function scrapeStoreProducts(storeWebsiteUrl) {
     try {
       const wooProducts = await scrapeWooCommerce(url);
       if (wooProducts.length > 0) {
-        return finalizeELiquidProducts(wooProducts, url, 'woocommerce');
+        return finalizeCatalogProducts(wooProducts, url, 'woocommerce');
       }
     } catch (error) {
       console.warn(`[scraper] WooCommerce HTML scrape failed: ${error.message}`);
     }
   }
 
-  const eLiquidPaths = discoverELiquidPathsFromHtml(homepageHtml, url);
+  const catalogPaths = discoverCatalogPathsFromHtml(homepageHtml, url);
   const origin = originOf(url);
-  const eLiquidOnlyPaths = [
-    ...eLiquidPaths,
+  const fallbackPaths = [
+    ...catalogPaths,
+    `${origin}/shop/`,
+    `${origin}/collections/all`,
+    `${origin}/products/`,
     `${origin}/collections/e-liquids`,
-    `${origin}/collections/e-liquid`,
-    `${origin}/collections/e-juice`,
-    `${origin}/collections/e-liquid-juice`,
-    `${origin}/collections/vape-juice`,
     `${origin}/product-category/e-liquids/`,
-    `${origin}/product-category/e-liquid/`,
+    `${origin}/product-category/disposables/`,
+    `${origin}/product-category/devices/`,
   ];
-
-  if (!eLiquidPaths.length && !homepageHtml) {
-    throw new ApiError(
-      422,
-      'No E-Liquids category found on this store. The scraper only collects E-Liquids / E-Juice / Vape Juice products.'
-    );
-  }
 
   const htmlProducts = [];
   const seen = new Set();
 
-  for (const path of eLiquidOnlyPaths) {
-    if (htmlProducts.length >= 40) break;
+  for (const path of fallbackPaths) {
+    if (htmlProducts.length >= 80) break;
     try {
       const html = await fetchPageHtml(path);
       const parsed = parseProductsFromHtml(html, path, detectPlatform(html, path));
       for (const p of parsed) {
-        p.category = p.category || 'E-Liquids';
-        if (!isLikelyELiquidProduct(p) || seen.has(p.externalId)) continue;
+        if (!isCatalogProduct(p) || seen.has(p.externalId)) continue;
         seen.add(p.externalId);
         htmlProducts.push(p);
       }
     } catch (error) {
-      console.warn(`[scraper] E-Liquids path failed (${path}): ${error.message}`);
+      console.warn(`[scraper] Catalog path failed (${path}): ${error.message}`);
     }
   }
 
   if (htmlProducts.length) {
-    await enrichHtmlProducts(htmlProducts, new Map(), 40);
-    return finalizeELiquidProducts(htmlProducts, url, platform);
+    await enrichHtmlProducts(htmlProducts, new Map(), 60);
+    return finalizeCatalogProducts(htmlProducts, url, platform);
   }
 
   throw new ApiError(
     422,
-    'No E-Liquids category found on this store. The scraper only collects E-Liquids / E-Juice / Vape Juice products. Unrelated categories (Devices, Tobacco, Cigars, Disposables, Pods, CBD, etc.) are never scraped.'
+    'No products found at this URL. Confirm the store has a public product catalog and try again.'
   );
 }
 
-/** Collect likely E-Liquids category URLs from homepage markup. */
-function discoverELiquidPathsFromHtml(html, baseUrl) {
+/** Collect likely product-category URLs from homepage markup. */
+function discoverCatalogPathsFromHtml(html, baseUrl) {
   if (!html) return [];
   const paths = [];
   const seen = new Set();
@@ -1223,44 +1259,67 @@ function discoverELiquidPathsFromHtml(html, baseUrl) {
   while ((match = linkRe.exec(html)) !== null) {
     const href = match[1];
     const label = cleanText(stripTags(match[2]));
-    if (!isELiquidCategoryName(`${href} ${label}`)) continue;
-    if (isExcludedNonELiquidCategory(label)) continue;
+    const hay = `${href} ${label}`;
+    const looksLikeCategory =
+      /\/(collections|product-category|shop|products)\b/i.test(href) ||
+      /\b(e[\s_-]?liquid|disposables?|devices?|pods?|kits?|accessories|batter|coils?|tanks?|pouches?)\b/i.test(
+        hay
+      );
+    if (!looksLikeCategory) continue;
+    if (isNonCatalogCategory(label)) continue;
     const absolute = toAbsoluteUrl(href, baseUrl);
     if (!absolute || seen.has(absolute)) continue;
     seen.add(absolute);
     paths.push(absolute);
   }
-  return paths.slice(0, 12);
+  return paths.slice(0, 24);
 }
 
-function finalizeELiquidProducts(products, url, platform) {
-  const filtered = dedupeProducts(products).filter(isLikelyELiquidProduct);
+/** @deprecated */
+function discoverELiquidPathsFromHtml(html, baseUrl) {
+  return discoverCatalogPathsFromHtml(html, baseUrl);
+}
+
+function finalizeCatalogProducts(products, url, platform) {
+  const filtered = dedupeProducts(products).filter(isCatalogProduct);
   console.log(
-    `[scraper] Crawl complete: ${filtered.length} E-Liquid products from ${url} (${platform})`
+    `[scraper] Crawl complete: ${filtered.length} catalog products from ${url} (${platform})`
   );
 
   if (!filtered.length) {
     throw new ApiError(
       422,
-      'No E-Liquids products found at this URL. Confirm the store has a public E-Liquids / E-Juice category and try again.'
+      'No products found at this URL. Confirm the store has a public product catalog and try again.'
     );
   }
 
   return filtered;
 }
 
-/** WooCommerce JSON APIs — E-Liquids category tree only (no flat catalog crawl). */
+/** @deprecated */
+function finalizeELiquidProducts(products, url, platform) {
+  return finalizeCatalogProducts(products, url, platform);
+}
+
+/** WooCommerce JSON APIs — full category tree (no e-liquid-only restriction). */
 async function scrapeWooCommerceApisOnly(storeUrl) {
   const origin = originOf(storeUrl);
 
   try {
     const products = await scrapeWooByCategories(origin);
     if (products.length) {
-      console.log(`[scraper] WooCommerce E-Liquids category crawl: ${products.length} products`);
+      console.log(`[scraper] WooCommerce category crawl: ${products.length} products`);
       return products;
     }
   } catch (error) {
-    console.warn(`[scraper] Woo E-Liquids category crawl failed: ${error.message}`);
+    console.warn(`[scraper] Woo category crawl failed: ${error.message}`);
+  }
+
+  try {
+    const flat = await scrapeWooStoreApi(origin);
+    if (flat.length) return flat;
+  } catch (error) {
+    console.warn(`[scraper] Woo Store API failed: ${error.message}`);
   }
 
   return [];

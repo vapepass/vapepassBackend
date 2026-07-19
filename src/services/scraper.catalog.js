@@ -2,22 +2,30 @@ import { resolveSharedDescription, cleanDescription } from '../utils/description
 
 const NICOTINE_RE = /(\d+(?:\.\d+)?)\s*mg(?:\s*\/?\s*m[lL])?/i;
 const VOLUME_RE = /(\d+(?:\.\d+)?)\s*m[lL]\b/i;
-const POD_HINT_RE = /\b(pod|cartridge|pre[- ]?filled|disposable)\b/i;
-const BOTTLE_HINT_RE = /\b(e[- ]?liquid|e[- ]?juice|refill|bottle|salt\s*nic)\b/i;
+const POD_HINT_RE = /\b(pod|cartridge|pre[- ]?filled)\b/i;
+const DISPOSABLE_HINT_RE = /\b(disposable\s*vapes?|disposables?|puff\s*bar|vape\s*bar)\b/i;
+const DEVICE_HINT_RE =
+  /\b(vape\s*kits?|starter\s*kits?|mods?\b|devices?|tanks?|atomizers?|box\s*mod)\b/i;
+const HARDWARE_HINT_RE =
+  /\b(coils?|batter(?:y|ies)|chargers?|drip\s*tips?|glass(?:ware)?|replacement\s*parts?|accessories)\b/i;
+const POUCH_HINT_RE = /\b(nicotine\s*pouches?|pouches?)\b/i;
+const BOTTLE_HINT_RE = /\b(e[- ]?liquid|e[- ]?juice|refill|bottle|salt\s*nic|freebase|nic\s*salt)\b/i;
 
 /**
- * Flexible match for the store's E-Liquids section (URL/title may vary).
- * Matches: E-Liquids, E-Liquid, E Juice, E-Juice, Vape Juice, Vape Liquid, etc.
+ * Flexible match for E-Liquids section names (still used for typing / emoji).
  */
 export const ELIQUID_CATEGORY_RE =
   /\b(e[\s_-]?liquids?|e[\s_-]?juices?|vape[\s_-]?juices?|vape[\s_-]?liquids?)\b/i;
 
 /**
- * Categories that must never be scraped (hardware, tobacco, snacks, etc.).
- * Evaluated after E-Liquid match so "Disposable E-Liquids" is still allowed.
+ * Categories that are NOT part of the retail vape catalog (food, apparel, etc.).
+ * Hardware, disposables, pods, pouches, and accessories ARE scraped.
  */
-export const EXCLUDED_NON_ELIQUID_CATEGORY_RE =
-  /\b(devices?|vape\s*kits?|starter\s*kits?|disposable\s*vapes?|disposables?\b(?![\s_-]*e[\s_-]?(?:liquid|juice))|pods?\b|tanks?|coils?|batter(?:y|ies)|chargers?|accessories|glass(?:ware)?|apparel|clothing|cbd|nicotine\s*pouches?|pouches?|hardware|mods?\b|atomizers?|drip\s*tips?|cotton|wire|replacement\s*parts?|cigars?|cigarettes?|tobacco(?![\s_-]*(?:e[\s_-]?(?:liquid|juice)|flavor|flavour|series))|snacks?|beverages?|drinks?|food|bongs?|rigs?|pipes?|rolling|papers?|grinders?|hookah|shisha|herbal|vaporizers?|novelties|lighters?|torches?|ashtrays?|cones?|wraps?|smoking)\b/i;
+export const NON_CATALOG_CATEGORY_RE =
+  /\b(snacks?|beverages?|drinks?|food|apparel|clothing|novelties|lighters?|torches?|ashtrays?|cigars?|cigarettes?\b|bongs?|rigs?|pipes?\b|rolling|papers?|grinders?|hookah|shisha|herbal|vaporizers?\b(?![\s_-]*pen)|cbd)\b/i;
+
+/** @deprecated Use NON_CATALOG_CATEGORY_RE — kept for older imports/tests */
+export const EXCLUDED_NON_ELIQUID_CATEGORY_RE = NON_CATALOG_CATEGORY_RE;
 
 /** True when a category / collection / product-type name is the E-Liquids section. */
 export function isELiquidCategoryName(name) {
@@ -25,35 +33,45 @@ export function isELiquidCategoryName(name) {
   return ELIQUID_CATEGORY_RE.test(String(name).replace(/[_-]+/g, ' ').trim());
 }
 
-/** True for clearly non–E-Liquid store sections (Devices, Pods, CBD, …). */
+/**
+ * True for store sections we intentionally skip (snacks, apparel, cigars, …).
+ * Does NOT exclude Devices, Pods, Disposables, Accessories, Pouches, etc.
+ */
 export function isExcludedNonELiquidCategory(name) {
+  return isNonCatalogCategory(name);
+}
+
+export function isNonCatalogCategory(name) {
   if (!name) return false;
   const normalized = String(name).replace(/[_-]+/g, ' ').trim();
+  // Never treat e-liquid style names as non-catalog
   if (isELiquidCategoryName(normalized)) return false;
-  return EXCLUDED_NON_ELIQUID_CATEGORY_RE.test(normalized);
+  return NON_CATALOG_CATEGORY_RE.test(normalized);
 }
 
 /**
- * Safety check: keep inventory rows that belong to E-Liquids.
- * Requires E-Liquids category membership or explicit e_liquid type / bottle naming.
- * Never keeps rows whose category/subcategory is an excluded non–E-Liquid section.
+ * Keep inventory rows that belong in the store catalog (full inventory).
+ * Rejects only clear non-catalog sections (food, apparel, cigars, …).
  */
-export function isLikelyELiquidProduct(product = {}) {
+export function isCatalogProduct(product = {}) {
   const category = product.category || '';
   const subcategory = product.subcategory || '';
-  const productType = product.productType || '';
   const name = product.name || '';
-  const text = `${category} ${subcategory} ${name} ${product.variantName || ''}`;
 
-  if (isExcludedNonELiquidCategory(category)) return false;
-  if (isExcludedNonELiquidCategory(subcategory)) return false;
-  if (isExcludedNonELiquidCategory(name) && !isELiquidCategoryName(category)) return false;
+  if (isNonCatalogCategory(category)) return false;
+  if (isNonCatalogCategory(subcategory)) return false;
+  // Title-only junk (e.g. snack SKUs miscategorized) — only drop when category is empty
+  if (!category && !subcategory && isNonCatalogCategory(name)) return false;
+  if (!String(name || product.variantName || '').trim()) return false;
+  return true;
+}
 
-  if (isELiquidCategoryName(category) || isELiquidCategoryName(subcategory)) {
-    return true;
-  }
-  if (productType === 'e_liquid' && BOTTLE_HINT_RE.test(text)) return true;
-  return false;
+/**
+ * @deprecated Prefer isCatalogProduct — kept for tests / callers that checked e-liquid membership.
+ * Now accepts any catalog product (full inventory).
+ */
+export function isLikelyELiquidProduct(product = {}) {
+  return isCatalogProduct(product);
 }
 
 /**
@@ -66,6 +84,37 @@ export function sanitizeProductPageUrl(url) {
   if (!trimmed) return null;
   if (/^(javascript|data|vbscript):/i.test(trimmed)) return null;
   return trimmed.length > 2048 ? trimmed.slice(0, 2048) : trimmed;
+}
+
+export function inferProductType(extras = {}, textForSpecs = '') {
+  if (extras.productType && extras.productType !== 'other') return extras.productType;
+
+  const hay = `${extras.category || ''} ${extras.subcategory || ''} ${textForSpecs}`.toLowerCase();
+
+  if (
+    isELiquidCategoryName(extras.category) ||
+    isELiquidCategoryName(extras.subcategory) ||
+    BOTTLE_HINT_RE.test(hay)
+  ) {
+    return 'e_liquid';
+  }
+  if (POUCH_HINT_RE.test(hay)) return 'pouch';
+  if (DISPOSABLE_HINT_RE.test(hay)) return 'disposable';
+  if (POD_HINT_RE.test(hay)) {
+    const volumeMatch = textForSpecs.match(VOLUME_RE);
+    const volumeMl = volumeMatch ? Number(volumeMatch[1]) : null;
+    return volumeMl != null && volumeMl <= 2 ? 'pod' : 'prefilled';
+  }
+  if (DEVICE_HINT_RE.test(hay)) return 'device';
+  if (HARDWARE_HINT_RE.test(hay)) return 'accessory';
+  if (/\bcoil/i.test(hay)) return 'coil';
+  if (/\bbatter/i.test(hay)) return 'battery';
+
+  const volumeMatch = textForSpecs.match(VOLUME_RE);
+  const volumeMl = volumeMatch ? Number(volumeMatch[1]) : null;
+  if (volumeMl != null && volumeMl > 2) return 'e_liquid';
+
+  return 'other';
 }
 
 /**
@@ -87,21 +136,7 @@ export function buildRichProduct(title, productUrl, extras = {}) {
   const nicotineMgMl = nicotineMatch ? Number(nicotineMatch[1]) : null;
   const volumeMl = volumeMatch ? Number(volumeMatch[1]) : null;
 
-  let productType = extras.productType || 'other';
-  if (productType === 'other') {
-    // Prefer bottle / volume signals over pod hints — "disposable" in a description
-    // must not turn a 30mL E-Liquid into productType "prefilled" (that fails BC bottle rules).
-    if (
-      isELiquidCategoryName(extras.category) ||
-      isELiquidCategoryName(extras.subcategory) ||
-      BOTTLE_HINT_RE.test(textForSpecs) ||
-      (volumeMl != null && volumeMl > 2)
-    ) {
-      productType = 'e_liquid';
-    } else if (POD_HINT_RE.test(textForSpecs)) {
-      productType = volumeMl != null && volumeMl <= 2 ? 'pod' : 'prefilled';
-    }
-  }
+  const productType = inferProductType(extras, textForSpecs);
 
   const { brand, flavor } = splitBrandFlavor(title, extras.brand);
   const platform = extras.platform || 'generic';
@@ -188,7 +223,6 @@ export function explodeShopifyProduct(item, origin, taxonomy = {}, descriptionPo
         category,
         subcategory,
         variantName: variantTitle,
-        // Same parent PDP URL on every variant — open product page, never cart/checkout
         productUrl,
         price: variant?.price != null ? Number(variant.price) : null,
       })
@@ -286,7 +320,6 @@ export function explodeWooProduct(item, origin, taxonomy = {}, descriptionPool =
       category,
       subcategory,
       variantName: variantTitle || null,
-      // Parent PDP URL when variant has no dedicated permalink
       productUrl: variant.permalink || productUrl,
       price: Number.isFinite(vPrice) ? vPrice : null,
     });
@@ -295,7 +328,6 @@ export function explodeWooProduct(item, origin, taxonomy = {}, descriptionPool =
 
 function extractWooVariations(item) {
   if (Array.isArray(item.variations) && item.variations.length) {
-    // Store API sometimes returns variation IDs only — skip until hydrated
     if (typeof item.variations[0] === 'object' && item.variations[0]?.id != null) {
       return item.variations.filter((v) => typeof v === 'object');
     }

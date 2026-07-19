@@ -109,7 +109,19 @@ const storeInventorySchema = new mongoose.Schema(
     },
     productType: {
       type: String,
-      enum: ['e_liquid', 'pod', 'cartridge', 'prefilled', 'device', 'other'],
+      enum: [
+        'e_liquid',
+        'pod',
+        'cartridge',
+        'prefilled',
+        'disposable',
+        'device',
+        'coil',
+        'battery',
+        'accessory',
+        'pouch',
+        'other',
+      ],
       default: 'other',
     },
     /**

@@ -6,6 +6,7 @@ import {
   isELiquidCategoryName,
   isExcludedNonELiquidCategory,
   isLikelyELiquidProduct,
+  isCatalogProduct,
 } from '../src/services/scraper.service.js';
 
 describe('Inventory scraper parser', () => {
@@ -55,7 +56,7 @@ describe('Inventory scraper parser', () => {
   });
 });
 
-describe('E-Liquids category matching', () => {
+describe('Catalog category matching (full inventory)', () => {
   test('matches flexible E-Liquids category names', () => {
     for (const name of [
       'E-Liquids',
@@ -71,7 +72,7 @@ describe('E-Liquids category matching', () => {
     }
   });
 
-  test('excludes non E-Liquid categories', () => {
+  test('keeps vape catalog categories (devices, disposables, accessories, pouches)', () => {
     for (const name of [
       'Devices',
       'Vape Kits',
@@ -82,15 +83,21 @@ describe('E-Liquids category matching', () => {
       'Batteries',
       'Chargers',
       'Accessories',
-      'Glass',
+      'Nicotine Pouches',
+    ]) {
+      assert.equal(isExcludedNonELiquidCategory(name), false, `should keep catalog: ${name}`);
+      assert.equal(isCatalogProduct({ name: 'Sample', category: name }), true);
+    }
+  });
+
+  test('excludes non-catalog categories (snacks, apparel, cigars)', () => {
+    for (const name of [
       'Apparel',
       'CBD',
-      'Nicotine Pouches',
       'Cigars',
       'Cigarettes',
       'Tobacco & Cigars',
       'Non-Carbonated Beverages, Snacks',
-      'non-carbonated-beverages-and-tobacco-5-gst-only',
       'Drinks & Snacks',
     ]) {
       assert.equal(isExcludedNonELiquidCategory(name), true, `expected exclude: ${name}`);
@@ -110,7 +117,7 @@ describe('E-Liquids category matching', () => {
     assert.equal(isExcludedNonELiquidCategory('Disposable E-Liquids'), false);
   });
 
-  test('isLikelyELiquidProduct keeps E-Liquids category membership', () => {
+  test('isCatalogProduct / isLikelyELiquidProduct keep full catalog membership', () => {
     assert.equal(
       isLikelyELiquidProduct({
         name: 'Mystery Flavor',
@@ -121,15 +128,15 @@ describe('E-Liquids category matching', () => {
       true
     );
     assert.equal(
-      isLikelyELiquidProduct({
+      isCatalogProduct({
         name: 'GeekVape Aegis',
         category: 'Devices',
         productType: 'device',
       }),
-      false
+      true
     );
     assert.equal(
-      isLikelyELiquidProduct({
+      isCatalogProduct({
         name: 'Cuban Cigar',
         category: 'Tobacco & Cigars',
         productType: 'other',
