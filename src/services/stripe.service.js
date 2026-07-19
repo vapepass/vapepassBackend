@@ -355,6 +355,197 @@ export const createBillingPortalSession = async (store) => {
   return { url: session.url };
 };
 
+/**
+ * Map Stripe card/decline errors to clear, customer-facing copy.
+ */
+function friendlyPaymentError(error) {
+  const code = String(error?.decline_code || error?.code || '').toLowerCase();
+  const messages = {
+    card_declined: 'Your card was declined. Please update your payment method and try again.',
+    insufficient_funds: 'Your card has insufficient funds. Please use another payment method and try again.',
+    expired_card: 'Your card has expired. Please update your payment method and try again.',
+    incorrect_cvc: 'The security code (CVC) appears to be incorrect. Please update your payment method and try again.',
+    processing_error: 'We could not process your payment due to a temporary issue. Please try again in a few minutes.',
+    authentication_required:
+      'Your bank requires additional authentication. Update your payment method in Manage Subscription, then retry.',
+  };
+
+  if (messages[code]) return messages[code];
+
+  if (error?.type === 'StripeCardError' || error?.rawType === 'card_error') {
+    return 'Your payment could not be processed. Please update your payment method and try again.';
+  }
+
+  return 'We could not process your renewal payment. Please update your payment method and try again.';
+}
+
+async function findOpenRenewalInvoice(stripe, store) {
+  const listParams = {
+    status: 'open',
+    limit: 5,
+  };
+
+  if (store.stripeSubscriptionId) {
+    listParams.subscription = store.stripeSubscriptionId;
+  } else if (store.stripeCustomerId) {
+    listParams.customer = store.stripeCustomerId;
+  } else {
+    return null;
+  }
+
+  const openInvoices = await stripe.invoices.list(listParams);
+  const unpaid = (openInvoices.data || []).find(
+    (inv) => inv.amount_due > 0 && ['open', 'uncollectible'].includes(inv.status)
+  );
+  if (unpaid) return unpaid;
+
+  // Fallback: latest invoice on the subscription (may still be open)
+  if (store.stripeSubscriptionId) {
+    const subscription = await stripe.subscriptions.retrieve(store.stripeSubscriptionId);
+    const latestId =
+      typeof subscription.latest_invoice === 'string'
+        ? subscription.latest_invoice
+        : subscription.latest_invoice?.id;
+    if (latestId) {
+      const latest = await stripe.invoices.retrieve(latestId);
+      if (latest && latest.amount_due > 0 && ['open', 'draft', 'uncollectible'].includes(latest.status)) {
+        if (latest.status === 'draft') {
+          return stripe.invoices.finalizeInvoice(latest.id);
+        }
+        return latest;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Retry a failed renewal against the existing Stripe subscription / open invoice.
+ * Does not create a new customer or subscription.
+ */
+export const retryFailedPayment = async (store) => {
+  if (!isConfigured()) {
+    throw new ApiError(503, 'Billing is temporarily unavailable. Please try again later.');
+  }
+
+  if (!store.stripeSubscriptionId && !store.stripeCustomerId) {
+    throw new ApiError(400, 'No subscription found to retry. Please subscribe first.');
+  }
+
+  const retryable = [SUBSCRIPTION_STATUS.PAST_DUE, SUBSCRIPTION_STATUS.PAUSED];
+  if (!retryable.includes(store.subscriptionStatus)) {
+    throw new ApiError(
+      400,
+      'Your subscription does not have a failed payment to retry right now.'
+    );
+  }
+
+  const Stripe = (await import('stripe')).default;
+  const stripe = new Stripe(env.stripe.secretKey);
+
+  let invoice;
+  try {
+    invoice = await findOpenRenewalInvoice(stripe, store);
+  } catch (error) {
+    console.warn('[billing] Failed to locate open invoice:', error.message);
+    throw new ApiError(
+      400,
+      'We could not find an outstanding renewal invoice. Please use Manage Subscription to update your payment method.'
+    );
+  }
+
+  if (!invoice) {
+    throw new ApiError(
+      400,
+      'There is no outstanding renewal payment right now. If you recently updated your card, refresh this page or use Manage Subscription.'
+    );
+  }
+
+  let paidInvoice;
+  try {
+    paidInvoice = await stripe.invoices.pay(invoice.id);
+  } catch (error) {
+    store.lastPaymentFailedAt = new Date();
+    store.paymentRetryCount = (store.paymentRetryCount || 0) + 1;
+    store.subscriptionStatus = SUBSCRIPTION_STATUS.PAST_DUE;
+    await store.save();
+    throw new ApiError(402, friendlyPaymentError(error));
+  }
+
+  if (paidInvoice.status !== 'paid') {
+    store.lastPaymentFailedAt = new Date();
+    store.subscriptionStatus = SUBSCRIPTION_STATUS.PAST_DUE;
+    await store.save();
+    throw new ApiError(
+      402,
+      'Your payment could not be completed. Please update your payment method and try again.'
+    );
+  }
+
+  let subscription = null;
+  if (store.stripeSubscriptionId) {
+    try {
+      subscription = await stripe.subscriptions.retrieve(store.stripeSubscriptionId);
+    } catch {
+      subscription = {
+        id: store.stripeSubscriptionId,
+        current_period_end: paidInvoice.lines?.data?.[0]?.period?.end,
+        current_period_start: paidInvoice.lines?.data?.[0]?.period?.start,
+      };
+    }
+  }
+
+  await activateStoreSubscription(store, subscription);
+  await store.save();
+
+  return {
+    store,
+    invoiceId: paidInvoice.id,
+    amountPaid: (paidInvoice.amount_paid || 0) / 100,
+    currency: (paidInvoice.currency || 'usd').toUpperCase(),
+    billing: await getBillingInfo(store),
+  };
+};
+
+/**
+ * Best-effort open-invoice summary for Billing UI (no schema changes).
+ */
+async function resolveOpenInvoiceSummary(store) {
+  if (!store || !isConfigured()) return null;
+  if (!store.stripeSubscriptionId && !store.stripeCustomerId) return null;
+
+  try {
+    const Stripe = (await import('stripe')).default;
+    const stripe = new Stripe(env.stripe.secretKey);
+    const invoice = await findOpenRenewalInvoice(stripe, store);
+    if (!invoice) return null;
+
+    const failureCode =
+      invoice.last_finalization_error?.code ||
+      invoice.charge?.failure_code ||
+      null;
+
+    return {
+      id: invoice.id,
+      amountDue: (invoice.amount_due || 0) / 100,
+      currency: (invoice.currency || 'usd').toUpperCase(),
+      status: invoice.status,
+      attempted: Boolean(invoice.attempted),
+      nextPaymentAttempt: invoice.next_payment_attempt
+        ? new Date(invoice.next_payment_attempt * 1000)
+        : null,
+      failureCode,
+      failureMessage: failureCode
+        ? friendlyPaymentError({ code: failureCode, decline_code: failureCode })
+        : null,
+    };
+  } catch (error) {
+    console.warn('[billing] Unable to load open invoice:', error.message);
+    return null;
+  }
+}
+
 export const handleWebhookEvent = async (event) => {
   const alreadyProcessed = await ProcessedStripeEvent.findOne({ eventId: event.id });
   if (alreadyProcessed) {
@@ -473,26 +664,116 @@ export const handleWebhookEvent = async (event) => {
   return { handled: true, storeId: store._id };
 };
 
+/**
+ * Sync local subscription status from Stripe when opening Billing.
+ * Ensures Payment Failed UI appears even if a webhook was missed.
+ * Does NOT treat "renewal date is today" alone as a failure — only Stripe
+ * payment state (past_due / unpaid open invoice) does.
+ */
+async function syncStoreBillingStatusFromStripe(store) {
+  if (!store || !isConfigured()) return store;
+  if (!store.stripeSubscriptionId && !store.stripeCustomerId) return store;
+
+  try {
+    const Stripe = (await import('stripe')).default;
+    const stripe = new Stripe(env.stripe.secretKey);
+
+    let stripeStatus = null;
+    let subscription = null;
+
+    if (store.stripeSubscriptionId) {
+      subscription = await stripe.subscriptions.retrieve(store.stripeSubscriptionId);
+      stripeStatus = subscription.status;
+      applyPeriodDates(store, subscription);
+    }
+
+    const mapped = mapStripeSubscriptionStatus(stripeStatus);
+    const openInvoice = await findOpenRenewalInvoice(stripe, store);
+    const hasUnpaidRenewal =
+      Boolean(openInvoice) &&
+      Number(openInvoice.amount_due || 0) > 0 &&
+      ['open', 'uncollectible'].includes(openInvoice.status);
+
+    let dirty = false;
+
+    if (mapped === SUBSCRIPTION_STATUS.ACTIVE && !hasUnpaidRenewal) {
+      if (store.subscriptionStatus !== SUBSCRIPTION_STATUS.ACTIVE) {
+        await activateStoreSubscription(store, subscription);
+        dirty = true;
+      }
+    } else if (
+      mapped === SUBSCRIPTION_STATUS.PAST_DUE ||
+      stripeStatus === 'unpaid' ||
+      hasUnpaidRenewal
+    ) {
+      if (store.subscriptionStatus !== SUBSCRIPTION_STATUS.PAST_DUE) {
+        store.subscriptionStatus = SUBSCRIPTION_STATUS.PAST_DUE;
+        store.lastPaymentFailedAt = store.lastPaymentFailedAt || new Date();
+        dirty = true;
+      }
+    } else if (mapped === SUBSCRIPTION_STATUS.PAUSED) {
+      if (store.subscriptionStatus !== SUBSCRIPTION_STATUS.PAUSED) {
+        store.subscriptionStatus = SUBSCRIPTION_STATUS.PAUSED;
+        store.assistantEnabled = false;
+        dirty = true;
+      }
+    } else if (mapped === SUBSCRIPTION_STATUS.EXPIRED) {
+      if (store.subscriptionStatus !== SUBSCRIPTION_STATUS.EXPIRED) {
+        store.subscriptionStatus = SUBSCRIPTION_STATUS.EXPIRED;
+        store.assistantEnabled = false;
+        dirty = true;
+      }
+    }
+
+    if (dirty) {
+      await store.save();
+    }
+  } catch (error) {
+    console.warn('[billing] Stripe status sync skipped:', error.message);
+  }
+
+  return store;
+}
+
 export const getBillingInfo = async (store = null) => {
+  if (store) {
+    await syncStoreBillingStatusFromStripe(store);
+  }
+
   const paymentMethod = await resolvePaymentMethodDisplay(store);
+  const status = store?.subscriptionStatus || null;
+  const paymentFailed =
+    status === SUBSCRIPTION_STATUS.PAST_DUE || status === SUBSCRIPTION_STATUS.PAUSED;
+  const openInvoice = paymentFailed ? await resolveOpenInvoiceSummary(store) : null;
+  const canRetryPayment =
+    paymentFailed && Boolean(store?.stripeSubscriptionId || store?.stripeCustomerId);
 
   return {
     monthlyPrice: MONTHLY_PRICE_CENTS / 100,
     currency: 'USD',
     configured: isConfigured(),
     plan: store?.subscriptionPlan || 'pro',
-    subscriptionStatus: store?.subscriptionStatus || null,
+    subscriptionStatus: status,
     subscriptionStartDate: store?.subscriptionStartDate || null,
     subscriptionEndDate: store?.subscriptionEndDate || null,
     nextBillingDate: store?.nextBillingDate || null,
     paymentRetryCount: store?.paymentRetryCount || 0,
+    lastPaymentFailedAt: store?.lastPaymentFailedAt || null,
+    /** Renewal recovery — driven by payment failure status, not renewal date alone */
+    paymentFailed,
+    canRetryPayment,
+    openInvoice,
+    paymentFailureMessage: paymentFailed
+      ? openInvoice?.failureMessage ||
+        'We were unable to renew your subscription because your recent payment could not be processed. Please retry your payment to continue using VapePass without interruption.'
+      : null,
     /** Auto Subscription — default ON */
     autoRenew: store?.autoRenew !== false,
     autoRenewUpdatedAt: store?.autoRenewUpdatedAt || null,
     hasStripeSubscription: Boolean(store?.stripeSubscriptionId),
     canManageAutoRenew:
       Boolean(store?.stripeSubscriptionId) &&
-      ['active', 'past_due'].includes(String(store?.subscriptionStatus || '')),
+      ['active', 'past_due'].includes(String(status || '')),
     /** Customer payment method (card brand / type) — never "Stripe" */
     billingProvider: paymentMethod.label,
     paymentMethodBrand: paymentMethod.brand,

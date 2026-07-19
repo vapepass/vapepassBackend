@@ -53,3 +53,16 @@ export const updateAutoRenew = asyncHandler(async (req, res) => {
     result
   );
 });
+
+export const retryPayment = asyncHandler(async (req, res) => {
+  const store = await storeService.getStoreByUser(req.user);
+  const result = await stripeService.retryFailedPayment(store);
+
+  return sendSuccess(res, 200, 'Payment successful. Your subscription is active again.', {
+    store: result.store,
+    billing: result.billing,
+    invoiceId: result.invoiceId,
+    amountPaid: result.amountPaid,
+    currency: result.currency,
+  });
+});

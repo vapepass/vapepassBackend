@@ -84,4 +84,20 @@ router.post('/confirm', billingController.confirmCheckout);
  */
 router.patch('/auto-renew', billingController.updateAutoRenew);
 
+/**
+ * @swagger
+ * /billing/retry-payment:
+ *   post:
+ *     summary: Retry a failed subscription renewal payment
+ *     tags: [Billing]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Payment succeeded and subscription reactivated
+ *       402:
+ *         description: Payment failed again
+ */
+router.post('/retry-payment', billingController.retryPayment);
+
 export default router;
