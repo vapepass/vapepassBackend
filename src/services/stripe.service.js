@@ -473,21 +473,177 @@ export const handleWebhookEvent = async (event) => {
   return { handled: true, storeId: store._id };
 };
 
-export const getBillingInfo = (store = null) => ({
-  monthlyPrice: MONTHLY_PRICE_CENTS / 100,
-  currency: 'USD',
-  configured: isConfigured(),
-  plan: store?.subscriptionPlan || 'pro',
-  subscriptionStatus: store?.subscriptionStatus || null,
-  subscriptionStartDate: store?.subscriptionStartDate || null,
-  subscriptionEndDate: store?.subscriptionEndDate || null,
-  nextBillingDate: store?.nextBillingDate || null,
-  paymentRetryCount: store?.paymentRetryCount || 0,
-  /** Auto Subscription — default ON */
-  autoRenew: store?.autoRenew !== false,
-  autoRenewUpdatedAt: store?.autoRenewUpdatedAt || null,
-  hasStripeSubscription: Boolean(store?.stripeSubscriptionId),
-  canManageAutoRenew:
-    Boolean(store?.stripeSubscriptionId) &&
-    ['active', 'past_due'].includes(String(store?.subscriptionStatus || '')),
-});
+export const getBillingInfo = async (store = null) => {
+  const paymentMethod = await resolvePaymentMethodDisplay(store);
+
+  return {
+    monthlyPrice: MONTHLY_PRICE_CENTS / 100,
+    currency: 'USD',
+    configured: isConfigured(),
+    plan: store?.subscriptionPlan || 'pro',
+    subscriptionStatus: store?.subscriptionStatus || null,
+    subscriptionStartDate: store?.subscriptionStartDate || null,
+    subscriptionEndDate: store?.subscriptionEndDate || null,
+    nextBillingDate: store?.nextBillingDate || null,
+    paymentRetryCount: store?.paymentRetryCount || 0,
+    /** Auto Subscription — default ON */
+    autoRenew: store?.autoRenew !== false,
+    autoRenewUpdatedAt: store?.autoRenewUpdatedAt || null,
+    hasStripeSubscription: Boolean(store?.stripeSubscriptionId),
+    canManageAutoRenew:
+      Boolean(store?.stripeSubscriptionId) &&
+      ['active', 'past_due'].includes(String(store?.subscriptionStatus || '')),
+    /** Customer payment method (card brand / type) — never "Stripe" */
+    billingProvider: paymentMethod.label,
+    paymentMethodBrand: paymentMethod.brand,
+    paymentMethodLast4: paymentMethod.last4,
+    paymentMethodType: paymentMethod.type,
+  };
+};
+
+const CARD_BRAND_LABELS = {
+  visa: 'Visa',
+  mastercard: 'Mastercard',
+  amex: 'American Express',
+  american_express: 'American Express',
+  discover: 'Discover',
+  diners: 'Diners Club',
+  diners_club: 'Diners Club',
+  jcb: 'JCB',
+  unionpay: 'UnionPay',
+  elo: 'Elo',
+  hipercard: 'Hipercard',
+};
+
+const PAYMENT_TYPE_LABELS = {
+  card: 'Card',
+  link: 'Link',
+  paypal: 'PayPal',
+  cashapp: 'Cash App',
+  affirm: 'Affirm',
+  afterpay_clearpay: 'Afterpay',
+  klarna: 'Klarna',
+  us_bank_account: 'Bank Account',
+  sepa_debit: 'SEPA Debit',
+  ideal: 'iDEAL',
+  bancontact: 'Bancontact',
+  giropay: 'Giropay',
+  eps: 'EPS',
+  p24: 'Przelewy24',
+  alipay: 'Alipay',
+  wechat_pay: 'WeChat Pay',
+};
+
+function formatCardBrand(brand) {
+  if (!brand) return null;
+  const key = String(brand).toLowerCase().trim();
+  if (CARD_BRAND_LABELS[key]) return CARD_BRAND_LABELS[key];
+  return key
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function formatPaymentType(type) {
+  if (!type) return null;
+  const key = String(type).toLowerCase().trim();
+  if (PAYMENT_TYPE_LABELS[key]) return PAYMENT_TYPE_LABELS[key];
+  return formatCardBrand(key);
+}
+
+function summarizePaymentMethod(paymentMethod) {
+  if (!paymentMethod || typeof paymentMethod !== 'object') {
+    return { label: 'Not Available', brand: null, last4: null, type: null };
+  }
+
+  const type = paymentMethod.type || null;
+
+  if (type === 'card' && paymentMethod.card) {
+    const brand = formatCardBrand(paymentMethod.card.brand);
+    const last4 = paymentMethod.card.last4 || null;
+    return {
+      label: brand || 'Card',
+      brand: brand || paymentMethod.card.brand || null,
+      last4,
+      type: 'card',
+    };
+  }
+
+  if (type === 'link') {
+    return { label: 'Link', brand: 'Link', last4: null, type: 'link' };
+  }
+
+  if (type === 'us_bank_account' && paymentMethod.us_bank_account) {
+    const bank = paymentMethod.us_bank_account.bank_name;
+    const last4 = paymentMethod.us_bank_account.last4 || null;
+    return {
+      label: bank ? formatCardBrand(bank) : 'Bank Account',
+      brand: bank || null,
+      last4,
+      type,
+    };
+  }
+
+  const label = formatPaymentType(type) || 'Not Available';
+  return { label, brand: label === 'Not Available' ? null : label, last4: null, type };
+}
+
+/**
+ * Resolve the customer's default payment method from Stripe (subscription or customer).
+ * Used only for display — does not alter billing/checkout behavior.
+ */
+async function resolvePaymentMethodDisplay(store) {
+  const empty = { label: 'Not Available', brand: null, last4: null, type: null };
+
+  if (!store || !isConfigured()) return empty;
+  if (!store.stripeCustomerId && !store.stripeSubscriptionId) return empty;
+
+  try {
+    const Stripe = (await import('stripe')).default;
+    const stripe = new Stripe(env.stripe.secretKey);
+
+    let paymentMethod = null;
+
+    if (store.stripeSubscriptionId) {
+      const subscription = await stripe.subscriptions.retrieve(store.stripeSubscriptionId, {
+        expand: ['default_payment_method'],
+      });
+      const pm = subscription.default_payment_method;
+      if (pm && typeof pm === 'object') {
+        paymentMethod = pm;
+      } else if (typeof pm === 'string') {
+        paymentMethod = await stripe.paymentMethods.retrieve(pm);
+      }
+    }
+
+    if (!paymentMethod && store.stripeCustomerId) {
+      const customer = await stripe.customers.retrieve(store.stripeCustomerId, {
+        expand: ['invoice_settings.default_payment_method'],
+      });
+
+      if (customer && !customer.deleted) {
+        const defaultPm = customer.invoice_settings?.default_payment_method;
+        if (defaultPm && typeof defaultPm === 'object') {
+          paymentMethod = defaultPm;
+        } else if (typeof defaultPm === 'string') {
+          paymentMethod = await stripe.paymentMethods.retrieve(defaultPm);
+        }
+
+        if (!paymentMethod) {
+          const methods = await stripe.paymentMethods.list({
+            customer: store.stripeCustomerId,
+            type: 'card',
+            limit: 1,
+          });
+          paymentMethod = methods.data?.[0] || null;
+        }
+      }
+    }
+
+    return summarizePaymentMethod(paymentMethod);
+  } catch (error) {
+    console.warn('[billing] Unable to resolve payment method:', error.message);
+    return { label: 'Unknown', brand: null, last4: null, type: null };
+  }
+}

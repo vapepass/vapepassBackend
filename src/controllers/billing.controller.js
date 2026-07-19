@@ -6,7 +6,7 @@ import * as stripeService from '../services/stripe.service.js';
 
 export const getBillingInfo = asyncHandler(async (req, res) => {
   const store = await storeService.getStoreByUser(req.user);
-  const info = stripeService.getBillingInfo(store);
+  const info = await stripeService.getBillingInfo(store);
 
   return sendSuccess(res, 200, 'Billing info retrieved', info);
 });
