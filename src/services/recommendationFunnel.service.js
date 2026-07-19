@@ -13,7 +13,6 @@ import {
   sanitizeUserHint,
 } from '../utils/nlu.js';
 import {
-  buildFollowUpAck,
   buildOpenShoppingPrompt,
   emptyPreferences,
   evaluatePreferenceCompleteness,
@@ -21,6 +20,8 @@ import {
   filterInventoryByPreferences,
   mergePreferences,
   preferencesToHint,
+  applyContextualAnswer,
+  buildContextualFollowUp,
 } from './preferenceConversation.service.js';
 
 export function matchOption(step, userMessage) {
@@ -723,13 +724,46 @@ async function resolvePastBrandSteps(store, session, step, candidateIds, path) {
  */
 async function advancePreferenceConversation(store, session, userMessage, inventory) {
   const state = session.funnelState || {};
-  const incoming = extractShoppingPreferences(userMessage);
-  const preferences = mergePreferences(state.preferences || emptyPreferences(), incoming);
-  const hint = preferencesToHint(preferences);
+  const lastAsked = state.lastAsked || null;
+  const askAttempts = { ...(state.askAttempts || {}) };
 
+  let preferences = mergePreferences(
+    state.preferences || emptyPreferences(),
+    extractShoppingPreferences(userMessage)
+  );
+
+  // Interpret short answers in context of the question we just asked (e.g. "both" on ice)
+  let contextual = applyContextualAnswer(userMessage, lastAsked, preferences);
+  // If lastAsked was lost (older sessions / schema), still resolve ice-style answers
+  if (!lastAsked && !contextual.resolved && !contextual.unclear) {
+    const peek = evaluatePreferenceCompleteness(preferences, inventory);
+    if (peek.missing === 'cooling') {
+      contextual = applyContextualAnswer(userMessage, 'cooling', preferences);
+    }
+  }
+  preferences = mergePreferences(preferences, contextual.preferences);
+  if (contextual.resolved && contextual.preferences?.cooling != null) {
+    preferences.cooling = contextual.preferences.cooling;
+  }
+
+  const hint = preferencesToHint(preferences);
   const evaluation = evaluatePreferenceCompleteness(preferences, inventory);
 
   if (!evaluation.ready) {
+    const missing = evaluation.missing;
+    const sameAsk = lastAsked === missing;
+    if (sameAsk || contextual.unclear) {
+      askAttempts[missing] = (askAttempts[missing] || 0) + 1;
+    } else {
+      askAttempts[missing] = 0;
+    }
+
+    const reply = buildContextualFollowUp(preferences, missing, {
+      askAttempts,
+      unclear: contextual.unclear,
+      defaultAsk: evaluation.ask,
+    });
+
     session.funnelState = {
       phase: 'prefer',
       currentStepId: null,
@@ -739,9 +773,12 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       path: state.path || [],
       preferenceHints: preferences.rawHints || [],
       preferences,
+      lastAsked: missing,
+      askAttempts,
+      lastAskText: reply,
     };
     return {
-      reply: buildFollowUpAck(preferences, evaluation.ask),
+      reply,
       replyType: 'text',
       options: [],
       products: [],
@@ -769,6 +806,9 @@ async function advancePreferenceConversation(store, session, userMessage, invent
     path: state.path || [],
     preferenceHints: preferences.rawHints || [],
     preferences,
+    lastAsked: null,
+    askAttempts: {},
+    lastAskText: null,
   };
 
   return finalizeRecommendation(store, session, ids, state.path || [], hint);

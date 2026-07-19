@@ -91,6 +91,15 @@ const chatSessionSchema = new mongoose.Schema(
           type: mongoose.Schema.Types.Mixed,
           default: null,
         },
+        /** Last missing preference we asked about (cooling, flavor, productType) */
+        lastAsked: { type: String, default: null },
+        /** How many times we've re-asked each missing preference */
+        askAttempts: {
+          type: mongoose.Schema.Types.Mixed,
+          default: () => ({}),
+        },
+        /** Last clarification / follow-up text (avoids identical repeats) */
+        lastAskText: { type: String, default: null },
       },
       default: () => ({
         phase: 'age',
@@ -101,6 +110,9 @@ const chatSessionSchema = new mongoose.Schema(
         path: [],
         preferenceHints: [],
         preferences: null,
+        lastAsked: null,
+        askAttempts: {},
+        lastAskText: null,
       }),
     },
     lastMessageAt: {

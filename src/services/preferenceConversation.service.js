@@ -245,6 +245,7 @@ export function evaluatePreferenceCompleteness(prefs = {}, inventory = []) {
     };
   }
 
+  // 'any' means user left ice open — ready to recommend
   return { ready: true, missing: null, ask: null };
 }
 
@@ -332,6 +333,7 @@ export function filterInventoryByPreferences(inventory = [], prefs = {}) {
     const icy = pool.filter((p) => /\b(ice|iced|frost|menthol|cool|chill)\b/i.test(productHaystack(p)));
     if (icy.length) pool = icy;
   }
+  // cooling === 'any' → do not filter by ice
 
   if (prefs.sweetness === 'sweet') {
     const sweet = pool.filter((p) => /\b(sweet|candy|dessert|sugar|mango|strawberry)\b/i.test(productHaystack(p)));
@@ -353,6 +355,7 @@ export function preferencesToHint(prefs = {}) {
   if (prefs.cooling === 'ice') bits.push('ice');
   if (prefs.cooling === 'heavy_ice') bits.push('heavy ice');
   if (prefs.cooling === 'no_ice') bits.push('no ice');
+  if (prefs.cooling === 'any') bits.push('any ice level');
   if (prefs.sweetness) bits.push(prefs.sweetness);
   if (prefs.rawHints?.length) bits.push(prefs.rawHints[prefs.rawHints.length - 1]);
   return bits.filter(Boolean).join(' | ');
@@ -369,17 +372,170 @@ export function emptyPreferences() {
   };
 }
 
-/** Follow-up after acknowledging a partial preference in the open prompt turn */
-export function buildFollowUpAck(prefs, ask) {
-  const bits = [];
-  if (prefs.productType) bits.push(TYPE_LABELS[prefs.productType] || prefs.productType);
-  if (prefs.flavorDirection) bits.push(prefs.flavorDirection);
-  if (prefs.specificFlavors?.length) bits.push(prefs.specificFlavors.join('/'));
-  if (prefs.cooling === 'ice' || prefs.cooling === 'heavy_ice') bits.push('icy');
-  if (prefs.cooling === 'no_ice') bits.push('no ice');
+/** Human summary of what we already know, e.g. "a fruity disposable (mango)" */
+export function summarizeCollectedPreferences(prefs = {}) {
+  const p = prefs || {};
+  const parts = [];
+  if (p.flavorDirection) parts.push(p.flavorDirection);
+  if (p.specificFlavors?.length) {
+    parts.push(p.specificFlavors.join('/'));
+  }
+  const typeLabel = p.productType ? TYPE_LABELS[p.productType] || p.productType : null;
+  if (!parts.length && typeLabel) return `a ${typeLabel.toLowerCase()} option`;
+  if (parts.length && typeLabel) {
+    return `a ${parts.join(' ')} ${typeLabel.toLowerCase().replace(/s$/, '')}`;
+  }
+  if (parts.length) return parts.join(' ');
+  return null;
+}
 
-  if (!bits.length) return ask;
-  return `Nice — ${bits.join(', ')}. ${ask}`;
+/**
+ * Interpret short/ambiguous answers in the context of the question we just asked.
+ */
+export function applyContextualAnswer(message, lastAsked, preferences = {}) {
+  const raw = sanitizeUserHint(message);
+  const t = foldText(raw);
+  const next = { ...preferences };
+  if (!lastAsked || !t) {
+    return { preferences: next, unclear: null, resolved: false };
+  }
+
+  if (lastAsked === 'cooling') {
+    // "both" is ambiguous — cannot set ice and no-ice together
+    if (/\bboth\b/.test(t) && !/\beither is fine\b/.test(t)) {
+      return { preferences: next, unclear: 'both', resolved: false };
+    }
+    if (
+      /\b(any|doesn't matter|doesnt matter|no preference|whatever|surprise me|you (pick|choose)|either is fine|either way|best (one|option|match)|pick (for me|the best))\b/.test(
+        t
+      )
+    ) {
+      next.cooling = 'any';
+      return { preferences: next, unclear: null, resolved: true };
+    }
+    if (/\b(heavy ice|extra ice|max ice|strong ice)\b/.test(t)) {
+      next.cooling = 'heavy_ice';
+      return { preferences: next, unclear: null, resolved: true };
+    }
+    if (
+      /\b(with ice|ice please|iced|icy|cooling|cool finish)\b/.test(t) ||
+      /^(ice|yes|yeah|yep|sure)$/.test(t)
+    ) {
+      next.cooling = 'ice';
+      return { preferences: next, unclear: null, resolved: true };
+    }
+    if (
+      /\b(no ice|without ice|no cooling|smooth without|non-?ice|not iced)\b/.test(t) ||
+      /^(no|nope|without|smooth)$/.test(t)
+    ) {
+      next.cooling = 'no_ice';
+      return { preferences: next, unclear: null, resolved: true };
+    }
+    // Short unclear reply while waiting on ice
+    if (t.split(/\s+/).length <= 3 && !/\b(ice|cool|smooth|menthol)\b/.test(t)) {
+      return { preferences: next, unclear: 'unclear', resolved: false };
+    }
+  }
+
+  if (lastAsked === 'flavor') {
+    if (/\b(any|doesn't matter|surprise|you choose)\b/.test(t)) {
+      next.flavorDirection = next.flavorDirection || 'fruity';
+      return { preferences: next, unclear: null, resolved: true };
+    }
+  }
+
+  if (lastAsked === 'productType') {
+    if (/\b(any|doesn't matter|surprise)\b/.test(t)) {
+      return { preferences: next, unclear: 'productType_any', resolved: false };
+    }
+  }
+
+  return { preferences: next, unclear: null, resolved: false };
+}
+
+/**
+ * Context-aware follow-up — references collected prefs and avoids repeating the same line.
+ */
+export function buildContextualFollowUp(prefs, missing, meta = {}) {
+  const summary = summarizeCollectedPreferences(prefs);
+  const attempt = Number(meta.askAttempts?.[missing] || 0);
+  const unclear = meta.unclear;
+
+  if (missing === 'cooling') {
+    const flavorHint =
+      prefs?.specificFlavors?.length > 0
+        ? prefs.specificFlavors.slice(0, 2).join('/')
+        : prefs?.flavorDirection || null;
+    const eitherWay = flavorHint
+      ? `or should I pick the best ${flavorHint} option available either way?`
+      : 'or should I pick the best match available either way?';
+
+    if (unclear === 'both') {
+      return [
+        summary
+          ? `I understand you're looking for ${summary}.`
+          : 'I can help you lock in the finish.',
+        '',
+        "Ice and no-ice are different experiences, so I can't apply both to a single recommendation.",
+        '',
+        `Did you want an icy / cooling effect, a smooth finish without ice, ${eitherWay}`,
+      ].join('\n');
+    }
+    if (unclear === 'unclear' || attempt >= 1) {
+      return [
+        summary ? `We're already set on ${summary}.` : 'Almost there.',
+        '',
+        'I just need your ice preference to finish:',
+        '',
+        '• Strong / icy cooling',
+        '• Smooth with no ice',
+        '• No preference — pick the best match either way',
+      ].join('\n');
+    }
+    return [
+      summary ? `Nice — ${summary}.` : 'Got it.',
+      '',
+      'Would you like it with ice / cooling, or smooth without ice?',
+    ].join('\n');
+  }
+
+  if (missing === 'flavor') {
+    if (attempt >= 1) {
+      return [
+        summary ? `Looking for ${summary}.` : 'Happy to help.',
+        '',
+        'What taste are you after — fruity, menthol, dessert, or a specific fruit like mango or strawberry?',
+      ].join('\n');
+    }
+    return [
+      summary ? `Got it — ${summary}.` : 'Got it.',
+      '',
+      'What flavor direction do you prefer — fruity, menthol/mint, dessert, candy, or citrus? You can also name a fruit like mango or strawberry.',
+    ].join('\n');
+  }
+
+  if (missing === 'productType') {
+    if (attempt >= 1) {
+      return [
+        summary ? `Noted: ${summary}.` : 'Happy to help.',
+        '',
+        'Which product type should I search — disposable vapes, e-liquids, pods, devices, or accessories?',
+      ].join('\n');
+    }
+    return [
+      summary ? `Nice — ${summary}.` : 'Got it.',
+      '',
+      meta.defaultAsk ||
+        'What type of product do you want — e-liquids, disposables, pods, or accessories?',
+    ].join('\n');
+  }
+
+  return meta.defaultAsk || 'Tell me a bit more about what you want.';
+}
+
+/** @deprecated use buildContextualFollowUp */
+export function buildFollowUpAck(prefs, ask) {
+  return buildContextualFollowUp(prefs, 'cooling', { defaultAsk: ask, askAttempts: {} });
 }
 
 export function foldPrefText(value) {
