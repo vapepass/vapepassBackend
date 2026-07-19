@@ -258,7 +258,7 @@ export async function sendMessage(storeId, sessionKey, message, options = {}) {
   const phase = session.funnelState?.phase || 'funnel';
   let guided = null;
 
-  if (phase === 'funnel' || phase === 'recommendation') {
+  if (phase === 'funnel' || phase === 'recommendation' || phase === 'variant_refine') {
     guided = await advanceFunnel(store, session, content, inventory);
   }
 

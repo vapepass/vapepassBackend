@@ -54,11 +54,21 @@ const chatSessionSchema = new mongoose.Schema(
       type: {
         phase: {
           type: String,
-          enum: ['age', 'funnel', 'recommendation', 'free_chat'],
+          enum: ['age', 'funnel', 'variant_refine', 'recommendation', 'free_chat'],
           default: 'age',
         },
         currentStepId: { type: String, default: null },
         candidateProductIds: [{ type: String }],
+        /** Parent catalog id when refining sibling flavor variants */
+        parentExternalId: { type: String, default: null },
+        /** Dimensions already asked during variant refine (ice, fruit, taste, …) */
+        variantPath: [
+          {
+            dimension: String,
+            optionId: String,
+            label: String,
+          },
+        ],
         path: [
           {
             stepId: String,
@@ -71,6 +81,8 @@ const chatSessionSchema = new mongoose.Schema(
         phase: 'age',
         currentStepId: null,
         candidateProductIds: [],
+        parentExternalId: null,
+        variantPath: [],
         path: [],
       }),
     },
