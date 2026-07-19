@@ -24,7 +24,7 @@ export const register = asyncHandler(async (req, res) => {
 });
 
 export const login = asyncHandler(async (req, res) => {
-  const { user, accessToken, refreshToken } = await authService.loginUser(
+  const { user, store, accessToken, refreshToken } = await authService.loginUser(
     req.body.email,
     req.body.password
   );
@@ -33,6 +33,7 @@ export const login = asyncHandler(async (req, res) => {
 
   return sendSuccess(res, 200, 'Login successful', {
     user,
+    store,
     accessToken,
   });
 });

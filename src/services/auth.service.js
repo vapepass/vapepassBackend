@@ -147,8 +147,15 @@ export const loginUser = async (email, password) => {
   user.refreshToken = refreshToken;
   await user.save({ validateBeforeSave: false });
 
+  // Include store so clients can route on DB subscriptionStatus after login
+  let store = null;
+  if (user.storeId) {
+    store = await Store.findById(user.storeId);
+  }
+
   return {
     user: sanitizeUser(user),
+    store,
     accessToken,
     refreshToken,
   };
