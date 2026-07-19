@@ -2,12 +2,34 @@ import Store from '../models/Store.js';
 import StoreInventory from '../models/StoreInventory.js';
 import { env } from '../config/env.js';
 import { getEntryStep, getTaxonomyStep, isBrandStep } from './taxonomy.service.js';
-import { scoreLabelMatch } from '../utils/nlu.js';
+import {
+  assessOptionMatch,
+  buildClarificationReply,
+  buildPreferenceAckReply,
+  isConfidentRefinementPhrase,
+  isKnownPreferenceSignal,
+  looksLikeProductTypeStep,
+  sanitizeUserHint,
+} from '../utils/nlu.js';
 
-/**
- * Dynamic GPT funnel helpers — step count and options come from store taxonomy.
- * After a parent product is chosen, optional variant_refine narrows sibling flavors.
- */
+export function matchOption(step, userMessage) {
+  if (!step?.options?.length) return null;
+  const text = sanitizeUserHint(userMessage) || String(userMessage || '').trim();
+  if (!text) return null;
+
+  // Explicit option token: ::option::<id>
+  const token = String(userMessage || '').trim().match(/^::option::(.+)$/i);
+  if (token) {
+    const id = token[1].trim();
+    return step.options.find((o) => String(o.id) === id) || null;
+  }
+
+  const assessment = assessOptionMatch(text, step.options);
+  if (assessment.status === 'confident' && assessment.option) {
+    return assessment.option;
+  }
+  return null;
+}
 
 const MAX_DIRECT_VARIANT_OPTIONS = 6;
 
@@ -108,35 +130,6 @@ export function formatOptionsForClient(step) {
     emoji: opt.emoji || '',
     value: opt.label,
   }));
-}
-
-export function matchOption(step, userMessage) {
-  if (!step?.options?.length) return null;
-  const text = String(userMessage || '').trim();
-  if (!text) return null;
-
-  // Explicit option token: ::option::<id>
-  const token = text.match(/^::option::(.+)$/i);
-  if (token) {
-    const id = token[1].trim();
-    return step.options.find((o) => String(o.id) === id) || null;
-  }
-
-  let best = null;
-  let bestScore = 0;
-  for (const opt of step.options) {
-    const label = String(opt.label || '');
-    const withEmoji = `${opt.emoji || ''} ${opt.label || ''}`.trim();
-    const score = Math.max(scoreLabelMatch(text, label), scoreLabelMatch(text, withEmoji));
-    if (score > bestScore) {
-      bestScore = score;
-      best = opt;
-    }
-  }
-
-  // Require a meaningful fuzzy / synonym match (avoids random weak hits)
-  if (best && bestScore >= 45) return best;
-  return null;
 }
 
 export async function loadProductsByIds(ids = []) {
@@ -445,31 +438,25 @@ function buildVariantIntro(parentName, questionPrompt, isFirst) {
   ].join('\n');
 }
 
+/**
+ * When multiple flavor variants exist, auto-select the best match from preferences.
+ * Do not ask the customer "Which flavor variant would you like?"
+ */
 async function startVariantRefine(store, session, chosen, path = []) {
   const siblings = await findSiblingVariants(chosen);
   if (siblings.length <= 1) return null;
 
-  const parentName = getParentDisplayName(chosen);
-  const question = buildNextVariantQuestion(siblings, []);
-  if (!question) return null;
+  const hints = [
+    ...(session.funnelState?.preferenceHints || []),
+    ...(path || []).map((p) => p.label).filter(Boolean),
+  ]
+    .filter(Boolean)
+    .join(' | ');
 
-  session.funnelState = {
-    phase: 'variant_refine',
-    currentStepId: null,
-    candidateProductIds: siblings.map((p) => String(p._id)),
-    parentExternalId: chosen.parentExternalId,
-    variantPath: [],
-    path,
-  };
+  const best =
+    (await pickBestProduct(store, siblings, path || [], hints)) || chosen;
 
-  return {
-    reply: buildVariantIntro(parentName, question.prompt, true),
-    replyType: 'options',
-    options: formatOptionsForClient({ options: question.options }),
-    products: [],
-    funnel: session.funnelState,
-    variantQuestion: question,
-  };
+  return completeVariantRecommendation(store, session, best, path);
 }
 
 async function completeVariantRecommendation(store, session, product, path = []) {
@@ -531,7 +518,36 @@ export async function advanceVariantRefine(store, session, userMessage) {
   const option = currentQuestion ? matchOption({ options: currentQuestion.options }, userMessage) : null;
 
   if (!option) {
-    // Free-text: pick best among remaining variants
+    // Unclear free-text must clarify — never force a variant pick on low confidence
+    if (
+      currentQuestion?.options?.length &&
+      !isConfidentRefinementPhrase(userMessage)
+    ) {
+      const assessment = assessOptionMatch(userMessage, currentQuestion.options);
+      const suggestionOpts =
+        assessment.suggestions?.length > 0
+          ? assessment.suggestions
+          : currentQuestion.options;
+      session.funnelState = {
+        ...state,
+        phase: 'variant_refine',
+        candidateProductIds: candidates.map((p) => String(p._id)),
+      };
+      return {
+        reply: buildClarificationReply(
+          userMessage,
+          currentQuestion,
+          suggestionOpts,
+          assessment
+        ),
+        replyType: 'options',
+        options: formatOptionsForClient({ options: suggestionOpts }),
+        products: [],
+        funnel: session.funnelState,
+      };
+    }
+
+    // Confident refinement phrase with remaining pool
     const chosen = await pickBestProduct(store, candidates, state.path || [], userMessage);
     return completeVariantRecommendation(store, session, chosen, state.path || []);
   }
@@ -802,14 +818,23 @@ export async function advanceFunnel(store, session, userMessage, inventory) {
 
   const option = matchOption(activeStep, userMessage);
   if (!option) {
-    const hint = String(userMessage || '').trim();
-    const preferenceHints = [
-      ...(state.preferenceHints || []),
-      ...(hint ? [hint] : []),
-    ].slice(-8);
+    const hint = sanitizeUserHint(userMessage) || String(userMessage || '').trim();
+    const assessment = assessOptionMatch(hint, activeStep.options || []);
+    const stepOptions = activeStep.options || [];
+    const suggestionOpts =
+      assessment.suggestions?.length > 0 ? assessment.suggestions : stepOptions;
 
-    // Already narrowed: free-text can finish with GPT over the current candidate pool.
-    if (state.candidateProductIds?.length > 0) {
+    // Only finalize on clear refinement language after the pool is already narrowed
+    const canRefine =
+      state.candidateProductIds?.length > 0 &&
+      isConfidentRefinementPhrase(hint) &&
+      assessment.status !== 'ambiguous';
+
+    if (canRefine) {
+      const preferenceHints = [
+        ...(state.preferenceHints || []),
+        ...(hint ? [hint] : []),
+      ].slice(-8);
       session.funnelState = { ...state, preferenceHints };
       return finalizeRecommendation(
         store,
@@ -820,26 +845,46 @@ export async function advanceFunnel(store, session, userMessage, inventory) {
       );
     }
 
-    // Early funnel (e.g. "menthol" while still asking product type): keep chatting —
-    // do NOT score the entire catalog (slow + poor UX for natural language).
+    // Valid taste preference at the wrong step (e.g. "menthol" while asking product type):
+    // remember it and continue — never say "I couldn't match".
+    const preferenceAtWrongStep =
+      isKnownPreferenceSignal(hint) &&
+      (looksLikeProductTypeStep(activeStep) ||
+        !(state.candidateProductIds || []).length ||
+        assessment.status === 'unknown');
+
+    if (preferenceAtWrongStep) {
+      const preferenceHints = [
+        ...(state.preferenceHints || []),
+        ...(hint ? [hint] : []),
+      ].slice(-8);
+      session.funnelState = {
+        ...state,
+        phase: 'funnel',
+        currentStepId: activeStep.id,
+        preferenceHints,
+      };
+      return {
+        reply: buildPreferenceAckReply(hint, activeStep, stepOptions),
+        replyType: 'options',
+        options: formatOptionsForClient(activeStep),
+        products: [],
+        funnel: session.funnelState,
+        stepId: activeStep.id,
+      };
+    }
+
+    // Genuinely unmatched / ambiguous option text
     session.funnelState = {
       ...state,
       phase: 'funnel',
       currentStepId: activeStep.id,
-      preferenceHints,
+      preferenceHints: state.preferenceHints || [],
     };
-    const examples = (activeStep.options || [])
-      .slice(0, 5)
-      .map((o) => o.label)
-      .filter(Boolean);
-    const exampleBit = examples.length ? ` For example: ${examples.join(', ')}.` : '';
-    const ack = hint
-      ? `Got it — I'll keep “${hint}” in mind.`
-      : 'Happy to help.';
     return {
-      reply: `${ack} ${activeStep.prompt || 'What type of product are you looking for?'}${exampleBit}`,
+      reply: buildClarificationReply(hint, activeStep, suggestionOpts, assessment),
       replyType: 'options',
-      options: formatOptionsForClient(activeStep),
+      options: formatOptionsForClient({ options: suggestionOpts }),
       products: [],
       funnel: session.funnelState,
       stepId: activeStep.id,
