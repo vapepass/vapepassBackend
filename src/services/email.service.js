@@ -20,13 +20,26 @@ function extractEmailAddress(value) {
   return (match ? match[1] : raw).trim().toLowerCase();
 }
 
+function hasResend() {
+  return Boolean(env.email.resendApiKey);
+}
+
+function hasSmtp() {
+  return Boolean(env.email.host && env.email.user && env.email.pass);
+}
+
 /**
- * Gmail (and many SMTP providers) reject messages when From ≠ authenticated user.
- * Prefer SMTP_USER as the envelope From when EMAIL_FROM uses a different address.
+ * Prefer Resend From, then EMAIL_FROM, then SMTP user.
+ * Gmail SMTP requires From === authenticated user.
  */
 function resolveFromAddress() {
   const configuredFrom = String(env.email.from || '').trim();
   const smtpUser = String(env.email.user || '').trim();
+
+  if (hasResend()) {
+    // Resend: use verified domain From, or onboarding@resend.dev for testing
+    return configuredFrom || 'VapePass <onboarding@resend.dev>';
+  }
 
   if (!configuredFrom && smtpUser) {
     return `VapePass <${smtpUser}>`;
@@ -52,24 +65,18 @@ function resolveFromAddress() {
 
 function getTransporter() {
   const from = resolveFromAddress();
-  if (!env.email.host || !from) return null;
+  if (!hasSmtp() || !from) return null;
 
   if (!transporter) {
     transporter = nodemailer.createTransport({
       host: env.email.host,
       port: env.email.port,
       secure: env.email.secure,
-      auth:
-        env.email.user && env.email.pass
-          ? { user: env.email.user, pass: env.email.pass }
-          : undefined,
-      // Prevent Railway/production requests from hanging on slow SMTP
+      auth: { user: env.email.user, pass: env.email.pass },
       connectionTimeout: 12_000,
       greetingTimeout: 12_000,
       socketTimeout: 20_000,
-      tls: {
-        minVersion: 'TLSv1.2',
-      },
+      tls: { minVersion: 'TLSv1.2' },
     });
   }
 
@@ -77,32 +84,47 @@ function getTransporter() {
 }
 
 export function isEmailConfigured() {
-  return Boolean(env.email.host && env.email.user && env.email.pass && resolveFromAddress());
+  return hasResend() || (hasSmtp() && Boolean(resolveFromAddress()));
+}
+
+export function getEmailProvider() {
+  if (hasResend()) return 'resend';
+  if (hasSmtp()) return 'smtp';
+  return 'none';
 }
 
 export function getSupportAdminEmail() {
   return String(env.email.supportAdmin || '').trim();
 }
 
-/** Log SMTP readiness once at boot (no secrets). */
+/** Log email readiness once at boot (no secrets). */
 export function logEmailConfigStatus() {
   if (configLogged) return;
   configLogged = true;
 
-  const configured = isEmailConfigured();
+  const provider = getEmailProvider();
   const admin = getSupportAdminEmail();
 
   console.info(
-    `[email] SMTP ${configured ? 'configured' : 'NOT configured'} — ` +
-      `host=${env.email.host || 'n/a'}, port=${env.email.port}, ` +
-      `user=${env.email.user || 'n/a'}, from=${resolveFromAddress() || 'n/a'}, ` +
-      `supportAdmin=${admin || 'MISSING (set SUPPORT_ADMIN_EMAIL)'}`
+    `[email] provider=${provider} — ` +
+      `from=${resolveFromAddress() || 'n/a'}, ` +
+      `supportAdmin=${admin || 'MISSING (set SUPPORT_ADMIN_EMAIL)'}` +
+      (provider === 'smtp'
+        ? `, host=${env.email.host}, port=${env.email.port}, user=${env.email.user}`
+        : '')
   );
 
-  if (!configured) {
+  if (provider === 'none') {
     console.warn(
-      '[email] Set SMTP_HOST, SMTP_USER, SMTP_PASS, and EMAIL_FROM on the host (Railway). ' +
-        '.env files are not deployed.'
+      '[email] No email provider configured. Set RESEND_API_KEY (recommended on Railway) ' +
+        'or SMTP_HOST/SMTP_USER/SMTP_PASS.'
+    );
+  }
+
+  if (provider === 'smtp' && env.nodeEnv === 'production') {
+    console.warn(
+      '[email] Using SMTP in production. Railway often blocks Gmail port 587 (Connection timeout). ' +
+        'Prefer RESEND_API_KEY (HTTPS) for reliable delivery.'
     );
   }
 
@@ -113,12 +135,57 @@ export function logEmailConfigStatus() {
   }
 }
 
-async function sendMail({ to, subject, text, html, replyTo }) {
-  const transport = getTransporter();
-  const from = resolveFromAddress();
+async function sendViaResend({ to, subject, text, html, replyTo, from }) {
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.email.resendApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from,
+      to: [to],
+      subject,
+      text,
+      html,
+      ...(replyTo ? { reply_to: replyTo } : {}),
+    }),
+  });
 
-  if (!transport || !from) {
-    console.warn(`[email] SMTP not configured. Would send to ${to}: ${subject}`);
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message = data?.message || data?.error || `Resend HTTP ${response.status}`;
+    throw new Error(message);
+  }
+
+  return { sent: true, messageId: data?.id, provider: 'resend' };
+}
+
+async function sendViaSmtp({ to, subject, text, html, replyTo, from }) {
+  const transport = getTransporter();
+  if (!transport) {
+    throw new Error('SMTP transport not available');
+  }
+
+  const info = await transport.sendMail({
+    from,
+    to,
+    replyTo: replyTo || undefined,
+    subject,
+    text,
+    html,
+  });
+
+  return { sent: true, messageId: info?.messageId, provider: 'smtp' };
+}
+
+async function sendMail({ to, subject, text, html, replyTo }) {
+  const from = resolveFromAddress();
+  const provider = getEmailProvider();
+
+  if (provider === 'none' || !from) {
+    console.warn(`[email] No provider configured. Would send to ${to}: ${subject}`);
     console.warn(text);
     return { sent: false, devFallback: true };
   }
@@ -129,38 +196,41 @@ async function sendMail({ to, subject, text, html, replyTo }) {
   }
 
   try {
-    const info = await transport.sendMail({
-      from,
-      to,
-      replyTo: replyTo || undefined,
-      subject,
-      text,
-      html,
-    });
+    const result =
+      provider === 'resend'
+        ? await sendViaResend({ to, subject, text, html, replyTo, from })
+        : await sendViaSmtp({ to, subject, text, html, replyTo, from });
 
     console.info(
-      `[email] Sent "${subject}" → ${to}` +
-        (info?.messageId ? ` (id: ${info.messageId})` : '')
+      `[email] Sent via ${result.provider} "${subject}" → ${to}` +
+        (result.messageId ? ` (id: ${result.messageId})` : '')
     );
 
-    return { sent: true, messageId: info?.messageId };
+    return result;
   } catch (error) {
-    console.error(`[email] sendMail failed → ${to} ("${subject}"):`, error.message);
-    return { sent: false, error: error.message };
+    const msg = error.message || String(error);
+    console.error(`[email] sendMail failed via ${provider} → ${to} ("${subject}"):`, msg);
+
+    if (/timeout|ETIMEDOUT|ECONNREFUSED/i.test(msg) && provider === 'smtp') {
+      console.error(
+        '[email] SMTP connection timed out. Railway commonly blocks outbound Gmail SMTP. ' +
+          'Add RESEND_API_KEY on Railway and redeploy (HTTPS email works).'
+      );
+    }
+
+    return { sent: false, error: msg };
   }
 }
 
 /**
- * Sends password reset email. In development without SMTP, logs the link.
+ * Sends password reset email. In development without a provider, logs the link.
  * Never throws — callers should treat forgot-password as always successful.
  */
 export async function sendPasswordResetEmail(to, resetToken) {
   const resetUrl = `${env.clientUrl.replace(/\/+$/, '')}/reset-password?token=${resetToken}`;
-  const transport = getTransporter();
-  const from = resolveFromAddress();
 
-  if (!transport || !from) {
-    console.warn(`[email] SMTP not configured. Password reset link for ${to}: ${resetUrl}`);
+  if (!isEmailConfigured()) {
+    console.warn(`[email] No provider configured. Password reset link for ${to}: ${resetUrl}`);
     return { sent: false, devFallback: true };
   }
 

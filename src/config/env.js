@@ -49,6 +49,11 @@ export const env = {
       .trim()
       .replace(/^["']|["']$/g, ''),
     logoUrl: process.env.EMAIL_LOGO_URL,
+    /**
+     * Resend HTTPS API (recommended on Railway).
+     * Gmail SMTP (port 587) often times out from cloud hosts.
+     */
+    resendApiKey: String(process.env.RESEND_API_KEY || '').trim(),
     /** Inbox for Free Setup Request admin notifications */
     supportAdmin: String(
       process.env.SUPPORT_ADMIN_EMAIL ||
