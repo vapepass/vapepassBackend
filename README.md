@@ -277,10 +277,11 @@ Set these **Environment Variables** in the Railway service (`.env` is not deploy
   1. Create a free account at https://resend.com
   2. Create an API key
   3. On Railway set `RESEND_API_KEY=re_...`
-  4. Set `EMAIL_FROM=VapePass <onboarding@resend.dev>` for testing, or a verified domain address for production
-  5. Set `SUPPORT_ADMIN_EMAIL` to the admin inbox
-  6. Redeploy and confirm logs show `provider=resend`
-- With `onboarding@resend.dev`, Resend may only deliver to the email on your Resend account until you verify a domain.
+  4. Set `EMAIL_FROM=VapePass <onboarding@resend.dev>` for testing
+  5. Until you verify a domain, set `RESEND_TESTING_TO=info@vapepass.ca` (your Resend account email) — all emails are redirected there with the intended recipient noted in the subject
+  6. Set `SUPPORT_ADMIN_EMAIL=info@vapepass.ca` for now
+  7. Redeploy and confirm logs show `provider=resend` and `testingRedirect=info@vapepass.ca`
+- **Production (send to any customer):** verify `vapepass.ca` at https://resend.com/domains, then set `EMAIL_FROM=VapePass <info@vapepass.ca>` (or `noreply@vapepass.ca`) and **remove** `RESEND_TESTING_TO`. Then set `SUPPORT_ADMIN_EMAIL` to whichever admin inbox you want.
 
 **MongoDB Atlas:** In Network Access, allow `0.0.0.0/0` so Railway can connect.
 

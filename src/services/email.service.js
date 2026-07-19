@@ -104,11 +104,13 @@ export function logEmailConfigStatus() {
 
   const provider = getEmailProvider();
   const admin = getSupportAdminEmail();
+  const testingTo = env.email.resendTestingTo;
 
   console.info(
     `[email] provider=${provider} — ` +
       `from=${resolveFromAddress() || 'n/a'}, ` +
       `supportAdmin=${admin || 'MISSING (set SUPPORT_ADMIN_EMAIL)'}` +
+      (testingTo ? `, testingRedirect=${testingTo}` : '') +
       (provider === 'smtp'
         ? `, host=${env.email.host}, port=${env.email.port}, user=${env.email.user}`
         : '')
@@ -128,11 +130,48 @@ export function logEmailConfigStatus() {
     );
   }
 
+  if (provider === 'resend' && !testingTo) {
+    console.warn(
+      '[email] Without a verified Resend domain, you can only send to your Resend account email. ' +
+        'Set RESEND_TESTING_TO=info@vapepass.ca for now, or verify vapepass.ca at resend.com/domains.'
+    );
+  }
+
   if (!admin) {
     console.warn(
       '[email] SUPPORT_ADMIN_EMAIL is not set — Free Setup admin notifications will be skipped.'
     );
   }
+}
+
+/**
+ * Resend free/test accounts can only deliver to the account owner email until a
+ * domain is verified. Optionally redirect every message to that inbox.
+ */
+function applyResendTestingRedirect({ to, subject, text, html }) {
+  const testingTo = env.email.resendTestingTo;
+  if (!hasResend() || !testingTo) {
+    return { to, subject, text, html, redirected: false };
+  }
+
+  if (extractEmailAddress(to) === testingTo) {
+    return { to: testingTo, subject, text, html, redirected: false };
+  }
+
+  const banner = `
+    <p style="margin:0 0 20px;padding:12px 14px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:10px;font-size:13px;color:#5b21b6;line-height:1.5;">
+      <strong>Resend test mode</strong><br/>
+      Intended recipient: ${String(to).replace(/</g, '&lt;')}
+    </p>
+  `;
+
+  return {
+    to: testingTo,
+    subject: `[→ ${to}] ${subject}`,
+    text: `${text}\n\n---\n[Resend test mode] Intended recipient: ${to}\n`,
+    html: `${banner}${html || ''}`,
+    redirected: true,
+  };
 }
 
 async function sendViaResend({ to, subject, text, html, replyTo, from }) {
@@ -195,26 +234,49 @@ async function sendMail({ to, subject, text, html, replyTo }) {
     return { sent: false, error: 'Missing recipient' };
   }
 
+  const delivery =
+    provider === 'resend'
+      ? applyResendTestingRedirect({ to, subject, text, html })
+      : { to, subject, text, html, redirected: false };
+
   try {
     const result =
       provider === 'resend'
-        ? await sendViaResend({ to, subject, text, html, replyTo, from })
+        ? await sendViaResend({
+            to: delivery.to,
+            subject: delivery.subject,
+            text: delivery.text,
+            html: delivery.html,
+            replyTo,
+            from,
+          })
         : await sendViaSmtp({ to, subject, text, html, replyTo, from });
 
     console.info(
-      `[email] Sent via ${result.provider} "${subject}" → ${to}` +
+      `[email] Sent via ${result.provider} "${delivery.subject}" → ${delivery.to}` +
+        (delivery.redirected ? ` (redirected from ${to})` : '') +
         (result.messageId ? ` (id: ${result.messageId})` : '')
     );
 
     return result;
   } catch (error) {
     const msg = error.message || String(error);
-    console.error(`[email] sendMail failed via ${provider} → ${to} ("${subject}"):`, msg);
+    console.error(
+      `[email] sendMail failed via ${provider} → ${delivery.to} ("${delivery.subject}"):`,
+      msg
+    );
 
     if (/timeout|ETIMEDOUT|ECONNREFUSED/i.test(msg) && provider === 'smtp') {
       console.error(
         '[email] SMTP connection timed out. Railway commonly blocks outbound Gmail SMTP. ' +
           'Add RESEND_API_KEY on Railway and redeploy (HTTPS email works).'
+      );
+    }
+
+    if (/only send testing emails|verify a domain/i.test(msg)) {
+      console.error(
+        '[email] Resend test restriction: verify vapepass.ca at https://resend.com/domains ' +
+          'OR set RESEND_TESTING_TO=info@vapepass.ca so all mail is redirected to your Resend account email.'
       );
     }
 

@@ -54,6 +54,14 @@ export const env = {
      * Gmail SMTP (port 587) often times out from cloud hosts.
      */
     resendApiKey: String(process.env.RESEND_API_KEY || '').trim(),
+    /**
+     * When set, all Resend emails are redirected to this inbox (Resend test-mode
+     * only allows the account owner email until a domain is verified).
+     * Example: info@vapepass.ca
+     */
+    resendTestingTo: String(process.env.RESEND_TESTING_TO || '')
+      .trim()
+      .toLowerCase(),
     /** Inbox for Free Setup Request admin notifications */
     supportAdmin: String(
       process.env.SUPPORT_ADMIN_EMAIL ||
