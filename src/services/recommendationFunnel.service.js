@@ -1,7 +1,7 @@
 import Store from '../models/Store.js';
 import StoreInventory from '../models/StoreInventory.js';
 import { env } from '../config/env.js';
-import { getEntryStep, getTaxonomyStep } from './taxonomy.service.js';
+import { getEntryStep, getTaxonomyStep, isBrandStep } from './taxonomy.service.js';
 
 /**
  * Dynamic GPT funnel helpers — step count and options come from store taxonomy.
@@ -343,7 +343,8 @@ export function buildNextVariantQuestion(candidates, variantPath = []) {
     ) {
       return {
         dimension: 'ice',
-        prompt: 'Do you prefer a cooling finish, or no ice?',
+        prompt:
+          'Do you enjoy a refreshing icy finish, or would you prefer something smooth without cooling?',
         options: iceGroups.map((g) => ({
           id: g.id,
           label: g.label,
@@ -365,7 +366,7 @@ export function buildNextVariantQuestion(candidates, variantPath = []) {
       if (covered >= Math.min(4, candidates.length * 0.5)) {
         return {
           dimension: 'fruit',
-          prompt: 'Which fruit profile do you prefer?',
+          prompt: 'Do you prefer berries, tropical fruits, citrus, or something sweeter like melon or grape?',
           options: fruitGroups.map((g) => ({
             id: g.id,
             label: g.label,
@@ -386,7 +387,7 @@ export function buildNextVariantQuestion(candidates, variantPath = []) {
     if (tasteGroups.length >= 2) {
       return {
         dimension: 'taste',
-        prompt: 'Which taste style do you prefer?',
+        prompt: 'Are you more into sweet, dessert-like, candy, beverage, or a cleaner mint/menthol taste?',
         options: tasteGroups.map((g) => ({
           id: g.id,
           label: g.label,
@@ -404,7 +405,7 @@ export function buildNextVariantQuestion(candidates, variantPath = []) {
     if (strength.length >= 2 && strength.some((g) => g.id !== 'no_ice_str')) {
       return {
         dimension: 'ice_strength',
-        prompt: 'How strong do you want the cooling sensation?',
+        prompt: 'Would you like light cooling, heavy ice, or no ice at all?',
         options: strength.map((g) => ({
           id: g.id,
           label: g.label,
@@ -587,6 +588,104 @@ export async function advanceVariantRefine(store, session, userMessage) {
 }
 
 /**
+ * Advance past brand-selection steps in-place (mutates session.funnelState).
+ * Returns the presentable non-brand step, or null if recommendation should run instead.
+ */
+function advancePastBrandSteps(store, session, step, candidateIds, path) {
+  const taxonomy = store.recommendationTaxonomy;
+  let current = step;
+  let pool = (candidateIds || []).map(String);
+  const visited = new Set();
+
+  while (current && isBrandStep(current) && !visited.has(current.id)) {
+    visited.add(current.id);
+    const allIds = [
+      ...new Set(current.options.flatMap((o) => o.productIds || []).map(String)),
+    ];
+    if (pool.length) {
+      const intersect = pool.filter((id) => allIds.includes(id));
+      pool = intersect.length ? intersect : allIds;
+    } else {
+      pool = allIds;
+    }
+
+    const nextIds = [
+      ...new Set(current.options.map((o) => o.nextStepId).filter(Boolean)),
+    ];
+    if (nextIds.length === 1) {
+      current = getTaxonomyStep(taxonomy, nextIds[0]);
+      continue;
+    }
+    session.funnelState = {
+      ...(session.funnelState || {}),
+      phase: 'funnel',
+      currentStepId: null,
+      candidateProductIds: pool,
+      path: path || session.funnelState?.path || [],
+      preferenceHints: session.funnelState?.preferenceHints || [],
+    };
+    return { step: null, candidateProductIds: pool, shouldRecommend: true };
+  }
+
+  if (!current) {
+    session.funnelState = {
+      ...(session.funnelState || {}),
+      phase: 'funnel',
+      candidateProductIds: pool,
+      path: path || session.funnelState?.path || [],
+      preferenceHints: session.funnelState?.preferenceHints || [],
+    };
+    return { step: null, candidateProductIds: pool, shouldRecommend: true };
+  }
+
+  session.funnelState = {
+    ...(session.funnelState || {}),
+    phase: 'funnel',
+    currentStepId: current.id,
+    candidateProductIds: pool.length
+      ? pool
+      : session.funnelState?.candidateProductIds || [],
+    parentExternalId: session.funnelState?.parentExternalId ?? null,
+    variantPath: session.funnelState?.variantPath || [],
+    path: path || session.funnelState?.path || [],
+    preferenceHints: session.funnelState?.preferenceHints || [],
+  };
+
+  return { step: current, candidateProductIds: pool, shouldRecommend: false };
+}
+
+/**
+ * Skip brand-selection steps at runtime (covers taxonomies built before brand removal).
+ */
+async function resolvePastBrandSteps(store, session, step, candidateIds, path) {
+  const resolved = advancePastBrandSteps(store, session, step, candidateIds, path);
+  const hints = (session.funnelState?.preferenceHints || []).filter(Boolean).join(' | ');
+
+  if (resolved.shouldRecommend) {
+    return finalizeRecommendation(
+      store,
+      session,
+      resolved.candidateProductIds,
+      path || [],
+      hints
+    );
+  }
+
+  if (resolved.step && resolved.step !== step) {
+    return {
+      reply: resolved.step.prompt,
+      replyType: 'options',
+      options: formatOptionsForClient(resolved.step),
+      products: [],
+      funnel: session.funnelState,
+      stepId: resolved.step.id,
+    };
+  }
+
+  return null;
+}
+
+/**
  * Start funnel after age verification.
  */
 export async function beginFunnel(store, session) {
@@ -606,9 +705,10 @@ export async function beginFunnel(store, session) {
       parentExternalId: null,
       variantPath: [],
       path: [],
+      preferenceHints: [],
     };
     const reply =
-      "Thanks for confirming. Tell me what you're looking for — e-liquids, disposables, devices, accessories, or anything else in our inventory — and I'll help you find a match.";
+      "Thanks for confirming. Tell me what you're looking for — flavors, product types, cooling level, or anything you've enjoyed before — and I'll find the best match in stock.";
     return {
       reply,
       replyType: 'text',
@@ -625,7 +725,11 @@ export async function beginFunnel(store, session) {
     parentExternalId: null,
     variantPath: [],
     path: [],
+    preferenceHints: [],
   };
+
+  const skipped = await resolvePastBrandSteps(store, session, entry, [], []);
+  if (skipped) return skipped;
 
   return {
     reply: entry.prompt,
@@ -642,7 +746,7 @@ export async function beginFunnel(store, session) {
  */
 export async function advanceFunnel(store, session, userMessage, inventory) {
   const taxonomy = store.recommendationTaxonomy;
-  const state = session.funnelState || {
+  let state = session.funnelState || {
     phase: 'funnel',
     currentStepId: taxonomy?.entryStepId || null,
     candidateProductIds: [],
@@ -666,19 +770,79 @@ export async function advanceFunnel(store, session, userMessage, inventory) {
     return null; // signal caller to use classic GPT chat
   }
 
-  const option = matchOption(step, userMessage);
+  // If an older taxonomy parked the user on a brand step, skip it before matching.
+  let activeStep = step;
+  if (isBrandStep(step)) {
+    const resolved = advancePastBrandSteps(
+      store,
+      session,
+      step,
+      state.candidateProductIds || [],
+      state.path || []
+    );
+    if (resolved.shouldRecommend) {
+      const hints = (session.funnelState?.preferenceHints || []).filter(Boolean).join(' | ');
+      return finalizeRecommendation(
+        store,
+        session,
+        resolved.candidateProductIds,
+        state.path || [],
+        [userMessage, hints].filter(Boolean).join(' | ')
+      );
+    }
+    activeStep = resolved.step;
+    state = session.funnelState || state;
+  }
+
+  const option = matchOption(activeStep, userMessage);
   if (!option) {
-    // Unmatched free text while in funnel — narrow via GPT recommendation over current candidates
-    const poolIds =
-      state.candidateProductIds?.length > 0
-        ? state.candidateProductIds
-        : inventory.map((p) => String(p._id));
-    return finalizeRecommendation(store, session, poolIds, state.path || [], userMessage);
+    const hint = String(userMessage || '').trim();
+    const preferenceHints = [
+      ...(state.preferenceHints || []),
+      ...(hint ? [hint] : []),
+    ].slice(-8);
+
+    // Already narrowed: free-text can finish with GPT over the current candidate pool.
+    if (state.candidateProductIds?.length > 0) {
+      session.funnelState = { ...state, preferenceHints };
+      return finalizeRecommendation(
+        store,
+        session,
+        state.candidateProductIds,
+        state.path || [],
+        preferenceHints.join(' | ')
+      );
+    }
+
+    // Early funnel (e.g. "menthol" while still asking product type): keep chatting —
+    // do NOT score the entire catalog (slow + poor UX for natural language).
+    session.funnelState = {
+      ...state,
+      phase: 'funnel',
+      currentStepId: activeStep.id,
+      preferenceHints,
+    };
+    const examples = (activeStep.options || [])
+      .slice(0, 5)
+      .map((o) => o.label)
+      .filter(Boolean);
+    const exampleBit = examples.length ? ` For example: ${examples.join(', ')}.` : '';
+    const ack = hint
+      ? `Got it — I'll keep “${hint}” in mind.`
+      : 'Happy to help.';
+    return {
+      reply: `${ack} ${activeStep.prompt || 'What type of product are you looking for?'}${exampleBit}`,
+      replyType: 'options',
+      options: formatOptionsForClient(activeStep),
+      products: [],
+      funnel: session.funnelState,
+      stepId: activeStep.id,
+    };
   }
 
   const nextPath = [
     ...(state.path || []),
-    { stepId: state.currentStepId, optionId: option.id, label: option.label },
+    { stepId: activeStep.id || state.currentStepId, optionId: option.id, label: option.label },
   ];
   const candidateIds = (option.productIds || []).map(String);
 
@@ -717,7 +881,17 @@ export async function advanceFunnel(store, session, userMessage, inventory) {
         parentExternalId: null,
         variantPath: [],
         path: nextPath,
+        preferenceHints: state.preferenceHints || [],
       };
+
+      const skipped = await resolvePastBrandSteps(
+        store,
+        session,
+        nextStep,
+        candidateIds,
+        nextPath
+      );
+      if (skipped) return skipped;
 
       return {
         reply: promptStep.prompt,
@@ -731,7 +905,17 @@ export async function advanceFunnel(store, session, userMessage, inventory) {
   }
 
   // Leaf — produce recommendation (may continue into variant refine)
-  return finalizeRecommendation(store, session, candidateIds, nextPath);
+  const leafHints = [...(state.preferenceHints || [])].filter(Boolean).join(' | ');
+  session.funnelState = {
+    phase: 'funnel',
+    currentStepId: state.currentStepId,
+    candidateProductIds: candidateIds,
+    parentExternalId: null,
+    variantPath: [],
+    path: nextPath,
+    preferenceHints: state.preferenceHints || [],
+  };
+  return finalizeRecommendation(store, session, candidateIds, nextPath, leafHints);
 }
 
 export async function finalizeRecommendation(
@@ -746,7 +930,14 @@ export async function finalizeRecommendation(
     ? products
     : await StoreInventory.find({ storeId: store._id, isActive: true }).limit(50).lean();
 
-  const chosen = await pickBestProduct(store, pool, path, userHint);
+  const combinedHint = [
+    userHint,
+    ...(session.funnelState?.preferenceHints || []),
+  ]
+    .filter(Boolean)
+    .join(' | ');
+
+  const chosen = await pickBestProduct(store, pool, path, combinedHint);
 
   if (chosen) {
     const variantFlow = await startVariantRefine(store, session, chosen, path);
@@ -814,7 +1005,7 @@ async function pickBestProduct(store, pool, path, userHint) {
           {
             role: 'system',
             content:
-              'Pick the single best inventory product for the customer. Return JSON: {"productId":"...","reason":"short"}. Prefer PRIORITY items when they fit. Only use provided ids.',
+              'Pick the single best inventory product for the customer based on their taste preferences (flavor, cooling/ice, sweetness, product type, overall experience). The customer may not know brands — choose the most suitable brand/product automatically from the candidates. Prefer PRIORITY items when they fit. Return JSON: {"productId":"...","reason":"short"}. Only use provided ids.',
           },
           {
             role: 'user',
@@ -850,6 +1041,13 @@ export async function ensureStoreTaxonomy(storeId) {
   const store = await Store.findById(storeId);
   if (!store) return null;
   if (store.recommendationTaxonomyStatus === 'ready' && store.recommendationTaxonomy) {
+    const { collapseBrandSteps, isBrandStep } = await import('./taxonomy.service.js');
+    const steps = Object.values(store.recommendationTaxonomy.steps || {});
+    if (steps.some((s) => isBrandStep(s))) {
+      store.recommendationTaxonomy = collapseBrandSteps(store.recommendationTaxonomy);
+      await store.save();
+      console.log(`[taxonomy] Collapsed brand steps for store ${storeId}`);
+    }
     return store;
   }
   try {

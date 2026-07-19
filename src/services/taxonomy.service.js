@@ -86,13 +86,16 @@ export function buildHeuristicTaxonomy(products = []) {
 
   const categoryMap = new Map();
   for (const p of products) {
+    // Preference-friendly grouping — never top-level by brand (customers rarely know brands).
     const key = (
-      p.category ||
       inventoryTypeLabel(p) ||
+      p.category ||
       p.subcategory ||
-      p.brand ||
+      p.productType ||
       'All products'
-    ).trim();
+    )
+      .toString()
+      .trim();
     if (!categoryMap.has(key)) categoryMap.set(key, []);
     categoryMap.get(key).push(String(p._id));
   }
@@ -314,25 +317,122 @@ function sanitizeTaxonomy(raw, validIds) {
     entryStepId = Object.keys(steps)[0] || null;
   }
 
-  return {
+  return collapseBrandSteps({
     version: 1,
     source: raw.source || 'gpt',
     entryStepId,
     steps,
     builtAt: new Date().toISOString(),
+  });
+}
+
+/** True when a funnel step asks the customer to pick a brand/manufacturer. */
+export function isBrandStep(step) {
+  if (!step) return false;
+  const hay = `${step.id || ''} ${step.prompt || ''}`.toLowerCase();
+  return /\b(brand|brands|manufacturer|vendor|which make|preferred brand)\b/.test(hay);
+}
+
+/**
+ * Remove brand-selection steps from the graph.
+ * Customers should not need brand knowledge — AI picks brands from preferences + inventory.
+ */
+export function collapseBrandSteps(taxonomy) {
+  if (!taxonomy?.steps || typeof taxonomy.steps !== 'object') return taxonomy;
+
+  const steps = {};
+  for (const [id, step] of Object.entries(taxonomy.steps)) {
+    steps[id] = {
+      ...step,
+      options: (step.options || []).map((opt) => ({ ...opt })),
+    };
+  }
+
+  const brandIds = new Set(
+    Object.values(steps)
+      .filter((s) => isBrandStep(s))
+      .map((s) => s.id)
+  );
+  if (!brandIds.size) {
+    return { ...taxonomy, steps };
+  }
+
+  for (const step of Object.values(steps)) {
+    step.options = (step.options || []).map((opt) => {
+      if (!opt.nextStepId || !brandIds.has(opt.nextStepId)) return opt;
+      const brandStep = steps[opt.nextStepId];
+      if (!brandStep?.options?.length) {
+        return { ...opt, nextStepId: null };
+      }
+
+      const nexts = [
+        ...new Set(brandStep.options.map((o) => o.nextStepId).filter(Boolean)),
+      ];
+      const unionIds = [
+        ...new Set([
+          ...(opt.productIds || []).map(String),
+          ...brandStep.options.flatMap((o) => (o.productIds || []).map(String)),
+        ]),
+      ];
+
+      if (nexts.length === 1) {
+        return {
+          ...opt,
+          productIds: unionIds.length ? unionIds : opt.productIds,
+          nextStepId: nexts[0],
+        };
+      }
+
+      const preferenceNext = nexts.find((nid) => steps[nid] && !isBrandStep(steps[nid]));
+      return {
+        ...opt,
+        productIds: unionIds.length ? unionIds : opt.productIds,
+        nextStepId: preferenceNext || null,
+      };
+    });
+  }
+
+  let entryStepId = taxonomy.entryStepId ? String(taxonomy.entryStepId) : null;
+  if (entryStepId && brandIds.has(entryStepId)) {
+    const entry = steps[entryStepId];
+    const nexts = [...new Set((entry?.options || []).map((o) => o.nextStepId).filter(Boolean))];
+    if (nexts.length === 1 && steps[nexts[0]]) {
+      entryStepId = nexts[0];
+    }
+  }
+
+  for (const id of brandIds) {
+    if (id !== entryStepId) delete steps[id];
+  }
+
+  // If entry is still a brand step, rewrite it into a preference prompt (options stay for matching).
+  if (entryStepId && steps[entryStepId] && isBrandStep(steps[entryStepId])) {
+    steps[entryStepId] = {
+      ...steps[entryStepId],
+      prompt:
+        'What kind of experience are you looking for — fruity, menthol/ice, dessert, or something smooth?',
+    };
+  }
+
+  return {
+    ...taxonomy,
+    entryStepId,
+    steps,
   };
 }
 
 async function callGptTaxonomyOnce(products, { maxTokens = 3500 } = {}) {
   const payload = products.map(compactProduct);
 
-  const system = `You are a recommendation UX architect for a vape retail chatbot.
-Analyze the store inventory and build a dynamic multi-step selection funnel.
+  const system = `You are a recommendation UX architect for a vape retail shopping assistant.
+Analyze the store inventory and build a dynamic multi-step preference funnel.
 
 Rules:
 - Do NOT use a fixed universal category list. Derive categories from THIS inventory only.
-- When the inventory spans multiple product types (e-liquids, disposables, devices, pods, accessories, pouches, etc.), the FIRST step MUST ask what type of product / inventory the customer wants.
-- Later steps may refine by brand, flavor, ice/cooling, nicotine, or other attributes relevant to the chosen type.
+- When the inventory spans multiple product types (e-liquids, disposables, devices, pods, accessories, pouches, etc.), the FIRST step MUST ask what type of product the customer wants.
+- NEVER ask the customer to choose a brand, manufacturer, vendor, or make. Customers usually do not know brands — the AI will select brands automatically from inventory.
+- Later steps MUST refine by preference attributes only: flavor family (fruit, berry, tropical, citrus, dessert, candy, beverage, menthol), cooling/ice level, sweetness, nicotine strength (when relevant), or overall experience (smooth, strong, icy).
+- Phrase prompts like an experienced store consultant (natural preference questions), not like a search form.
 - Do not assume every customer wants e-liquids or flavors.
 - Adapt depth to inventory size: small catalogs may need 1–2 steps; large catalogs may need more.
 - Every option must include productIds that exist in the inventory id list.
@@ -344,13 +444,13 @@ Rules:
 
   const user = {
     instruction:
-      'Build a compact recommendation hierarchy. First question should determine inventory type when multiple types exist. Return JSON with entryStepId and steps map. Keep response short.',
+      'Build a compact preference-driven recommendation hierarchy. First question should determine product type when multiple types exist. Never include brand-selection steps. Return JSON with entryStepId and steps map. Keep response short.',
     schema: {
       entryStepId: 'string',
       steps: {
         step_id: {
           id: 'string',
-          prompt: 'question shown to customer',
+          prompt: 'preference question shown to customer (never about brand)',
           options: [
             {
               id: 'string',
