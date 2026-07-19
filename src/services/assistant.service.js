@@ -255,10 +255,17 @@ export async function sendMessage(storeId, sessionKey, message, options = {}) {
 
   store = (await ensureStoreTaxonomy(store._id)) || store;
 
-  const phase = session.funnelState?.phase || 'funnel';
+  const phase = session.funnelState?.phase || 'prefer';
   let guided = null;
 
-  if (phase === 'funnel' || phase === 'recommendation' || phase === 'variant_refine') {
+  if (
+    phase === 'prefer' ||
+    phase === 'preference' ||
+    phase === 'funnel' ||
+    phase === 'recommendation' ||
+    phase === 'variant_refine' ||
+    phase === 'free_chat'
+  ) {
     guided = await advanceFunnel(store, session, content, inventory);
   }
 

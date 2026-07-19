@@ -47,14 +47,22 @@ const chatSessionSchema = new mongoose.Schema(
       default: [],
     },
     /**
-     * Dynamic GPT funnel state — depth and options come from store taxonomy,
-     * not hardcoded frontend steps.
+     * Conversation / funnel state.
+     * Prefer = NLP preference-driven shopping; funnel = legacy taxonomy steps.
      */
     funnelState: {
       type: {
         phase: {
           type: String,
-          enum: ['age', 'funnel', 'variant_refine', 'recommendation', 'free_chat'],
+          enum: [
+            'age',
+            'prefer',
+            'preference',
+            'funnel',
+            'variant_refine',
+            'recommendation',
+            'free_chat',
+          ],
           default: 'age',
         },
         currentStepId: { type: String, default: null },
@@ -76,6 +84,13 @@ const chatSessionSchema = new mongoose.Schema(
             label: String,
           },
         ],
+        /** Free-text preference hints collected during conversation */
+        preferenceHints: [{ type: String }],
+        /** Structured NLP preferences for dynamic shopping flow */
+        preferences: {
+          type: mongoose.Schema.Types.Mixed,
+          default: null,
+        },
       },
       default: () => ({
         phase: 'age',
@@ -84,6 +99,8 @@ const chatSessionSchema = new mongoose.Schema(
         parentExternalId: null,
         variantPath: [],
         path: [],
+        preferenceHints: [],
+        preferences: null,
       }),
     },
     lastMessageAt: {

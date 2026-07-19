@@ -2,6 +2,7 @@ import Store from '../models/Store.js';
 import StoreInventory from '../models/StoreInventory.js';
 import { env } from '../config/env.js';
 import { getEntryStep, getTaxonomyStep, isBrandStep } from './taxonomy.service.js';
+import { getRecommendableInventory } from './inventory.service.js';
 import {
   assessOptionMatch,
   buildClarificationReply,
@@ -11,6 +12,16 @@ import {
   looksLikeProductTypeStep,
   sanitizeUserHint,
 } from '../utils/nlu.js';
+import {
+  buildFollowUpAck,
+  buildOpenShoppingPrompt,
+  emptyPreferences,
+  evaluatePreferenceCompleteness,
+  extractShoppingPreferences,
+  filterInventoryByPreferences,
+  mergePreferences,
+  preferencesToHint,
+} from './preferenceConversation.service.js';
 
 export function matchOption(step, userMessage) {
   if (!step?.options?.length) return null;
@@ -708,31 +719,29 @@ async function resolvePastBrandSteps(store, session, step, candidateIds, path) {
 }
 
 /**
- * Start funnel after age verification.
+ * Preference-driven turn: extract NLP prefs → ask only what's missing → recommend.
  */
-export async function beginFunnel(store, session) {
-  const taxonomy = store.recommendationTaxonomy;
-  const entry = getEntryStep(taxonomy);
+async function advancePreferenceConversation(store, session, userMessage, inventory) {
+  const state = session.funnelState || {};
+  const incoming = extractShoppingPreferences(userMessage);
+  const preferences = mergePreferences(state.preferences || emptyPreferences(), incoming);
+  const hint = preferencesToHint(preferences);
 
-  if (taxonomy?.autoRecommendProductIds?.length && !entry) {
-    return finalizeRecommendation(store, session, taxonomy.autoRecommendProductIds, []);
-  }
+  const evaluation = evaluatePreferenceCompleteness(preferences, inventory);
 
-  if (!entry) {
-    // No taxonomy — free chat fallback message
+  if (!evaluation.ready) {
     session.funnelState = {
-      phase: 'free_chat',
+      phase: 'prefer',
       currentStepId: null,
       candidateProductIds: [],
       parentExternalId: null,
       variantPath: [],
-      path: [],
-      preferenceHints: [],
+      path: state.path || [],
+      preferenceHints: preferences.rawHints || [],
+      preferences,
     };
-    const reply =
-      "Thanks for confirming. Tell me what you're looking for — flavors, product types, cooling level, or anything you've enjoyed before — and I'll find the best match in stock.";
     return {
-      reply,
+      reply: buildFollowUpAck(preferences, evaluation.ask),
       replyType: 'text',
       options: [],
       products: [],
@@ -740,26 +749,68 @@ export async function beginFunnel(store, session) {
     };
   }
 
+  const matched = filterInventoryByPreferences(inventory, preferences);
+  const pool =
+    matched.length > 0
+      ? matched
+      : filterInventoryByPreferences(inventory, {
+          ...preferences,
+          cooling: null,
+          sweetness: null,
+        });
+  const ids = (pool.length ? pool : inventory).slice(0, 80).map((p) => String(p._id));
+
   session.funnelState = {
-    phase: 'funnel',
-    currentStepId: entry.id,
+    phase: 'prefer',
+    currentStepId: null,
+    candidateProductIds: ids,
+    parentExternalId: null,
+    variantPath: [],
+    path: state.path || [],
+    preferenceHints: preferences.rawHints || [],
+    preferences,
+  };
+
+  return finalizeRecommendation(store, session, ids, state.path || [], hint);
+}
+
+/**
+ * Start open preference conversation after age verification (not a fixed taxonomy tree).
+ */
+export async function beginFunnel(store, session) {
+  const inventory = await getRecommendableInventory(store._id);
+
+  if (inventory.length <= 2) {
+    const ids = inventory.map((p) => String(p._id));
+    if (ids.length) {
+      session.funnelState = {
+        phase: 'prefer',
+        preferences: emptyPreferences(),
+        preferenceHints: [],
+        candidateProductIds: ids,
+        path: [],
+      };
+      return finalizeRecommendation(store, session, ids, []);
+    }
+  }
+
+  session.funnelState = {
+    phase: 'prefer',
+    currentStepId: null,
     candidateProductIds: [],
     parentExternalId: null,
     variantPath: [],
     path: [],
     preferenceHints: [],
+    preferences: emptyPreferences(),
   };
 
-  const skipped = await resolvePastBrandSteps(store, session, entry, [], []);
-  if (skipped) return skipped;
-
   return {
-    reply: entry.prompt,
-    replyType: 'options',
-    options: formatOptionsForClient(entry),
+    reply: buildOpenShoppingPrompt(inventory, store.name),
+    replyType: 'text',
+    options: [],
     products: [],
     funnel: session.funnelState,
-    stepId: entry.id,
   };
 }
 
@@ -769,27 +820,43 @@ export async function beginFunnel(store, session) {
 export async function advanceFunnel(store, session, userMessage, inventory) {
   const taxonomy = store.recommendationTaxonomy;
   let state = session.funnelState || {
-    phase: 'funnel',
+    phase: 'prefer',
     currentStepId: taxonomy?.entryStepId || null,
     candidateProductIds: [],
     parentExternalId: null,
     variantPath: [],
     path: [],
+    preferences: emptyPreferences(),
   };
+
+  // New dynamic preference conversation (default path)
+  if (state.phase === 'prefer' || state.phase === 'preference') {
+    return advancePreferenceConversation(store, session, userMessage, inventory);
+  }
+
+  // After a recommendation, keep helping via preference mode
+  if (state.phase === 'recommendation' || state.phase === 'free_chat') {
+    session.funnelState = {
+      ...state,
+      phase: 'prefer',
+      preferences: state.preferences || emptyPreferences(),
+    };
+    return advancePreferenceConversation(store, session, userMessage, inventory);
+  }
 
   if (state.phase === 'variant_refine') {
     return advanceVariantRefine(store, session, userMessage);
   }
 
-  // Restart / free chat after final recommendation
-  if (state.phase === 'recommendation' || state.phase === 'free_chat') {
-    // Allow free chat after recommendation unless selecting another
-  }
-
+  // Legacy taxonomy sessions (existing in-progress chats)
   const step = getTaxonomyStep(taxonomy, state.currentStepId);
   if (!step) {
-    session.funnelState = { ...state, phase: 'free_chat' };
-    return null; // signal caller to use classic GPT chat
+    session.funnelState = {
+      ...state,
+      phase: 'prefer',
+      preferences: state.preferences || emptyPreferences(),
+    };
+    return advancePreferenceConversation(store, session, userMessage, inventory);
   }
 
   // If an older taxonomy parked the user on a brand step, skip it before matching.
