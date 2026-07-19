@@ -2,6 +2,7 @@ import Store from '../models/Store.js';
 import StoreInventory from '../models/StoreInventory.js';
 import { env } from '../config/env.js';
 import { getEntryStep, getTaxonomyStep, isBrandStep } from './taxonomy.service.js';
+import { scoreLabelMatch } from '../utils/nlu.js';
 
 /**
  * Dynamic GPT funnel helpers — step count and options come from store taxonomy.
@@ -111,7 +112,7 @@ export function formatOptionsForClient(step) {
 
 export function matchOption(step, userMessage) {
   if (!step?.options?.length) return null;
-  const text = String(userMessage || '').trim().toLowerCase();
+  const text = String(userMessage || '').trim();
   if (!text) return null;
 
   // Explicit option token: ::option::<id>
@@ -121,16 +122,21 @@ export function matchOption(step, userMessage) {
     return step.options.find((o) => String(o.id) === id) || null;
   }
 
-  const exact = step.options.find((o) => {
-    const label = String(o.label || '').toLowerCase();
-    const withEmoji = `${o.emoji || ''} ${o.label || ''}`.trim().toLowerCase();
-    return text === label || text === withEmoji || text.includes(label);
-  });
-  if (exact) return exact;
+  let best = null;
+  let bestScore = 0;
+  for (const opt of step.options) {
+    const label = String(opt.label || '');
+    const withEmoji = `${opt.emoji || ''} ${opt.label || ''}`.trim();
+    const score = Math.max(scoreLabelMatch(text, label), scoreLabelMatch(text, withEmoji));
+    if (score > bestScore) {
+      bestScore = score;
+      best = opt;
+    }
+  }
 
-  return (
-    step.options.find((o) => text.includes(String(o.label || '').toLowerCase())) || null
-  );
+  // Require a meaningful fuzzy / synonym match (avoids random weak hits)
+  if (best && bestScore >= 45) return best;
+  return null;
 }
 
 export async function loadProductsByIds(ids = []) {
