@@ -22,6 +22,7 @@ import {
   mergePreferences,
   preferencesToHint,
   applyContextualAnswer,
+  applyRelativePreferenceDeltas,
   buildContextualFollowUp,
 } from './preferenceConversation.service.js';
 import {
@@ -459,19 +460,23 @@ function buildVariantIntro(parentName, questionPrompt, isFirst) {
  * When multiple flavor variants exist, auto-select the best match from preferences.
  * Do not ask the customer "Which flavor variant would you like?"
  */
-async function startVariantRefine(store, session, chosen, path = []) {
+async function startVariantRefine(store, session, chosen, path = [], options = {}) {
   const siblings = await findSiblingVariants(chosen);
   if (siblings.length <= 1) return null;
 
   const hints = [
     ...(session.funnelState?.preferenceHints || []),
     ...(path || []).map((p) => p.label).filter(Boolean),
+    options.refineHint || '',
   ]
     .filter(Boolean)
     .join(' | ');
 
   const best =
-    (await pickBestProduct(store, siblings, path || [], hints)) || chosen;
+    (await pickBestProduct(store, siblings, path || [], hints, {
+      avoidProductIds: options.avoidProductIds || [],
+      preferDifferent: Boolean(options.avoidProductIds?.length),
+    })) || chosen;
 
   return completeVariantRecommendation(store, session, best, path);
 }
@@ -789,10 +794,15 @@ async function advancePreferenceConversation(store, session, userMessage, invent
   let preferences =
     intentKind === 'new'
       ? mergePreferences(emptyPreferences(), extractShoppingPreferences(userMessage))
-      : mergePreferences(
-          activeState.preferences || emptyPreferences(),
-          extractShoppingPreferences(userMessage)
-        );
+      : intentKind === 'refine' || activeState.fromCompletedRecommendation
+        ? applyRelativePreferenceDeltas(
+            activeState.preferences || emptyPreferences(),
+            userMessage
+          )
+        : mergePreferences(
+            activeState.preferences || emptyPreferences(),
+            extractShoppingPreferences(userMessage)
+          );
 
   // Interpret short answers in context of the question we just asked (e.g. "both" on ice)
   let contextual = applyContextualAnswer(userMessage, lastAsked, preferences);
@@ -803,14 +813,11 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       contextual = applyContextualAnswer(userMessage, 'cooling', preferences);
     }
   }
-  preferences = mergePreferences(preferences, contextual.preferences);
-  if (contextual.resolved && contextual.preferences?.cooling != null) {
-    preferences.cooling = contextual.preferences.cooling;
-  }
-
-  // Refine after a completed card: apply deltas onto preserved prefs
-  if (intentKind === 'refine' && (state.phase === 'recommendation' || state.phase === 'free_chat')) {
-    preferences = mergePreferences(state.preferences || emptyPreferences(), preferences);
+  if (intentKind !== 'refine' && !activeState.fromCompletedRecommendation) {
+    preferences = mergePreferences(preferences, contextual.preferences);
+    if (contextual.resolved && contextual.preferences?.cooling != null) {
+      preferences.cooling = contextual.preferences.cooling;
+    }
   }
 
   const hint = preferencesToHint(preferences);
@@ -843,6 +850,8 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       lastAsked: missing,
       askAttempts,
       lastAskText: reply,
+      excludedProductIds: activeState.excludedProductIds || [],
+      fromCompletedRecommendation: Boolean(activeState.fromCompletedRecommendation),
     };
     return {
       reply,
@@ -864,21 +873,44 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       accessory: 'Accessories',
     }[preferences.productType] || preferences.productType || 'that category';
 
-  // Strict category filter first
-  let pool = filterInventoryByPreferences(inventory, preferences);
+  // Strict category filter first.
+  // After a completed card (refine/continue), skip priority-only collapse and prefer a new SKU.
+  const isRefine =
+    intentKind === 'refine' || Boolean(activeState.fromCompletedRecommendation && intentKind !== 'new');
+  let pool = filterInventoryByPreferences(inventory, preferences, {
+    collapsePriority: !isRefine,
+  });
 
   // If flavor/cooling narrowed to zero, relax those — but NEVER the product type
   if (!pool.length && preferences.productType) {
-    pool = filterInventoryByPreferences(inventory, {
-      productType: preferences.productType,
-      flavorDirection: preferences.flavorDirection,
-      specificFlavors: preferences.specificFlavors,
-    });
+    pool = filterInventoryByPreferences(
+      inventory,
+      {
+        productType: preferences.productType,
+        flavorDirection: preferences.flavorDirection,
+        specificFlavors: preferences.specificFlavors,
+        cooling: preferences.cooling,
+      },
+      { collapsePriority: !isRefine }
+    );
   }
   if (!pool.length && preferences.productType) {
-    pool = filterInventoryByPreferences(inventory, {
-      productType: preferences.productType,
-    });
+    pool = filterInventoryByPreferences(
+      inventory,
+      {
+        productType: preferences.productType,
+        flavorDirection: preferences.flavorDirection,
+        specificFlavors: preferences.specificFlavors,
+      },
+      { collapsePriority: !isRefine }
+    );
+  }
+  if (!pool.length && preferences.productType) {
+    pool = filterInventoryByPreferences(
+      inventory,
+      { productType: preferences.productType },
+      { collapsePriority: !isRefine }
+    );
   }
 
   if (!pool.length) {
@@ -906,9 +938,29 @@ async function advancePreferenceConversation(store, session, userMessage, invent
   }
 
   const excluded = new Set((activeState.excludedProductIds || []).map(String));
+  // Refine: hard-exclude prior cards while alternatives exist; relax filters before giving up.
   if (excluded.size) {
     const withoutPrev = pool.filter((p) => !excluded.has(String(p._id)));
-    if (withoutPrev.length) pool = withoutPrev;
+    if (withoutPrev.length) {
+      pool = withoutPrev;
+    } else if (isRefine && preferences.productType) {
+      // Widen search but keep hard exclusion of already-shown products
+      let widened = filterInventoryByPreferences(
+        inventory,
+        { productType: preferences.productType, flavorDirection: preferences.flavorDirection },
+        { collapsePriority: false }
+      );
+      widened = widened.filter((p) => !excluded.has(String(p._id)));
+      if (!widened.length) {
+        widened = filterInventoryByPreferences(
+          inventory,
+          { productType: preferences.productType },
+          { collapsePriority: false }
+        ).filter((p) => !excluded.has(String(p._id)));
+      }
+      if (widened.length) pool = widened;
+      // else: keep original pool (may re-show) — only when truly no alternatives
+    }
   }
 
   const ids = pool.slice(0, 80).map((p) => String(p._id));
@@ -950,9 +1002,14 @@ async function advancePreferenceConversation(store, session, userMessage, invent
     askAttempts: {},
     lastAskText: null,
     excludedProductIds: [...excluded],
+    refinePass: isRefine,
+    fromCompletedRecommendation: false,
   };
 
-  return finalizeRecommendation(store, session, ids, session.funnelState.path || [], hint);
+  return finalizeRecommendation(store, session, ids, session.funnelState.path || [], hint, {
+    avoidProductIds: isRefine ? [...excluded] : [],
+    refineHint: isRefine ? String(userMessage || '').trim() : '',
+  });
 }
 
 /**
@@ -1067,6 +1124,8 @@ export async function advanceFunnel(store, session, userMessage, inventory) {
         phase: 'prefer',
         preferences: state.preferences || emptyPreferences(),
         preferenceHints: state.preferenceHints || [],
+        // Any reply after a card should re-search inventory (refine or continue), not reuse the card.
+        fromCompletedRecommendation: true,
       };
     }
     return advancePreferenceConversation(store, session, userMessage, inventory);
@@ -1269,7 +1328,8 @@ export async function finalizeRecommendation(
   session,
   productIds,
   path = [],
-  userHint = ''
+  userHint = '',
+  options = {}
 ) {
   const products = await loadProductsByIds(productIds);
   const pool = products.length
@@ -1281,10 +1341,22 @@ export async function finalizeRecommendation(
     preferencesToHint(session.funnelState?.preferences || {}) ||
     (session.funnelState?.preferenceHints || []).slice(-3).join(' | ');
 
-  const chosen = await pickBestProduct(store, pool, path, combinedHint);
+  const avoidProductIds = (options.avoidProductIds || []).map(String);
+  const refineHint = options.refineHint || '';
+  const rankingHint = refineHint
+    ? `${combinedHint} | refine: ${refineHint}`
+    : combinedHint;
+
+  const chosen = await pickBestProduct(store, pool, path, rankingHint, {
+    avoidProductIds,
+    preferDifferent: avoidProductIds.length > 0,
+  });
 
   if (chosen) {
-    const variantFlow = await startVariantRefine(store, session, chosen, path);
+    const variantFlow = await startVariantRefine(store, session, chosen, path, {
+      avoidProductIds,
+      refineHint,
+    });
     if (variantFlow) return variantFlow;
   }
 
@@ -1310,10 +1382,54 @@ function buildRecommendationText(product) {
   return `Based on what you told me, I'd recommend ${bits.filter(Boolean).join(' — ')}${specs ? ` (${specs})` : ''}.`;
 }
 
-async function pickBestProduct(store, pool, path, userHint) {
+function scoreProductForPreferences(product, hint = '') {
+  const hay = `${product.name || ''} ${product.brand || ''} ${product.flavor || ''} ${product.variantName || ''} ${product.description || ''}`.toLowerCase();
+  const h = String(hint || '').toLowerCase();
+  let score = 0;
+  if (product.isPriorityPromotion) score += 2;
+  if (/\bsweet|sweeter|candy|gummy|dessert\b/.test(h)) {
+    if (/\b(sweet|candy|gummy|dessert|sugar|honey|mango|strawberry|watermelon|peach|grape)\b/.test(hay)) {
+      score += 6;
+    }
+  }
+  if (/\bless sweet\b/.test(h) && !/\b(candy|gummy|dessert|sugar)\b/.test(hay)) score += 4;
+  if (/\b(heavy ice|more ice|icier|more cooling)\b/.test(h)) {
+    if (/\b(heavy ice|max ice|ultra ice|icy|frost|freeze|extra ice)\b/.test(hay)) score += 6;
+    else if (/\b(ice|iced|menthol|cool)\b/.test(hay)) score += 3;
+  }
+  if (/\b(less ice|no ice|less cooling)\b/.test(h) && !/\b(ice|iced|frost|menthol)\b/.test(hay)) {
+    score += 5;
+  }
+  if (/\btropical\b/.test(h) && /\b(tropical|mango|pineapple|passion|guava|coconut)\b/.test(hay)) score += 4;
+  if (/\bcitrus\b/.test(h) && /\b(citrus|lemon|lime|orange)\b/.test(hay)) score += 4;
+  if (/\bcandy\b/.test(h) && /\b(candy|gummy)\b/.test(hay)) score += 4;
+  if (/\bmenthol|mint\b/.test(h) && /\b(menthol|mint)\b/.test(hay)) score += 4;
+  if (/\bfruity\b/.test(h) && /\b(fruit|berry|mango|peach|grape|melon|apple)\b/.test(hay)) score += 3;
+  return score;
+}
+
+async function pickBestProduct(store, pool, path, userHint, options = {}) {
   if (!pool.length) return null;
-  const priority = pool.filter((p) => p.isPriorityPromotion);
-  const candidates = priority.length ? priority : pool;
+
+  const avoid = new Set((options.avoidProductIds || []).map(String));
+  let working = pool;
+  if (avoid.size && options.preferDifferent !== false) {
+    const without = pool.filter((p) => !avoid.has(String(p._id)));
+    if (without.length) working = without;
+  }
+
+  // Heuristic re-rank so refine deltas (sweeter, more ice, …) prefer better matches
+  const ranked = [...working].sort(
+    (a, b) => scoreProductForPreferences(b, userHint) - scoreProductForPreferences(a, userHint)
+  );
+
+  const priority = ranked.filter((p) => p.isPriorityPromotion);
+  const candidates =
+    options.preferDifferent && avoid.size
+      ? ranked
+      : priority.length
+        ? priority
+        : ranked;
 
   if (!env.openai.apiKey || candidates.length === 1) {
     return candidates[0];
@@ -1332,7 +1448,13 @@ async function pickBestProduct(store, pool, path, userHint) {
       nicotine: p.nicotineStrength,
       size: p.bottleSize,
       priority: Boolean(p.isPriorityPromotion),
+      matchScore: scoreProductForPreferences(p, userHint),
     }));
+
+    const avoidNote =
+      avoid.size > 0
+        ? ` The customer is refining a previous pick. Do NOT choose these already-shown product ids unless no other candidate fits: ${[...avoid].join(', ')}. Prefer a genuinely different product or variant that better matches the refined taste (e.g. sweeter, less ice, more fruity).`
+        : '';
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -1342,14 +1464,15 @@ async function pickBestProduct(store, pool, path, userHint) {
       },
       body: JSON.stringify({
         model: env.openai.model,
-        temperature: 0.2,
+        temperature: 0.35,
         max_tokens: 200,
         response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
             content:
-              'Pick the single best inventory product for the customer based on their taste preferences (flavor, cooling/ice, sweetness, product type, overall experience). The customer may not know brands — choose the most suitable brand/product automatically from the candidates. Prefer PRIORITY items when they fit. Return JSON: {"productId":"...","reason":"short"}. Only use provided ids.',
+              'Pick the single best inventory product for the customer based on their taste preferences (flavor, cooling/ice, sweetness, product type, overall experience). The customer may not know brands — choose the most suitable brand/product automatically from the candidates. Prefer PRIORITY items when they fit the refined request. Return JSON: {"productId":"...","reason":"short"}. Only use provided ids.' +
+              avoidNote,
           },
           {
             role: 'user',
@@ -1368,7 +1491,13 @@ async function pickBestProduct(store, pool, path, userHint) {
       const data = await response.json();
       const parsed = JSON.parse(data.choices?.[0]?.message?.content || '{}');
       const match = candidates.find((p) => String(p._id) === String(parsed.productId));
-      if (match) return match;
+      if (match) {
+        // If GPT ignored avoid-list and we have alternatives, force a different pick
+        if (avoid.has(String(match._id)) && candidates.some((p) => !avoid.has(String(p._id)))) {
+          return candidates.find((p) => !avoid.has(String(p._id))) || match;
+        }
+        return match;
+      }
     }
   } catch (error) {
     console.warn('[funnel] pickBestProduct GPT failed:', error.message);

@@ -147,7 +147,7 @@ export function extractShoppingPreferences(message) {
   }
   prefs.specificFlavors = [...new Set(prefs.specificFlavors)];
 
-  // Cooling
+  // Cooling — absolute phrases only; relative "more/less ice" handled in applyRelativePreferenceDeltas
   if (/\b(no ice|without ice|no cooling|not iced|smooth without)\b/i.test(clean)) {
     prefs.cooling = 'no_ice';
   } else if (/\b(heavy ice|extra ice|max ice|ultra ice)\b/i.test(clean)) {
@@ -157,16 +157,74 @@ export function extractShoppingPreferences(message) {
     hasToken('icy') ||
     hasToken('iced') ||
     hasToken('cooling') ||
-    /\b(cool finish|cold finish|frost|chill)\b/i.test(clean)
+    /\b(cool finish|cold finish|frost|chill|with ice)\b/i.test(clean)
   ) {
-    prefs.cooling = 'ice';
+    // Avoid treating "less ice" / "more ice" as plain ice — those are relative deltas
+    if (!/\b(less ice|more ice|less icy|more icy|icier|less cooling|more cooling)\b/i.test(clean)) {
+      prefs.cooling = 'ice';
+    }
   }
 
-  // Sweetness
-  if (hasToken('sweet') || /\bsweeter\b/i.test(clean)) prefs.sweetness = 'sweet';
-  if (/\b(less sweet|not sweet|not too sweet)\b/i.test(clean)) prefs.sweetness = 'less_sweet';
+  // Sweetness — relative phrases
+  if (/\b(less sweet|not sweet|not too sweet|less sugar|reduce(?:d)? sweet)\b/i.test(clean)) {
+    prefs.sweetness = 'less_sweet';
+  } else if (
+    hasToken('sweet') ||
+    /\bsweeter\b/i.test(clean) ||
+    /\bmore sweet\b/i.test(clean) ||
+    /\bcandy[- ]?like\b/i.test(clean)
+  ) {
+    prefs.sweetness = 'sweet';
+  }
 
   return prefs;
+}
+
+/**
+ * Apply relative refine language onto the previous preference pass.
+ * Escalates / de-escalates cooling & sweetness and amplifies flavor direction wording.
+ */
+export function applyRelativePreferenceDeltas(previous = {}, message = '') {
+  const clean = sanitizeUserHint(message);
+  const extracted = extractShoppingPreferences(clean);
+  // Don't let bare "ice" from extract clobber a relative delta we apply below
+  if (/\b(less ice|more ice|less icy|more icy|icier|less cooling|more cooling)\b/i.test(clean)) {
+    extracted.cooling = null;
+  }
+  const merged = mergePreferences(previous || emptyPreferences(), extracted);
+  const text = String(clean || '').toLowerCase();
+
+  // Cooling ladder: no_ice ↔ ice ↔ heavy_ice
+  if (/\b(less ice|less icy|less cooling|reduce(?:d)? ice|not too (?:icy|iced|cold))\b/i.test(text)) {
+    if (merged.cooling === 'heavy_ice') merged.cooling = 'ice';
+    else merged.cooling = 'no_ice';
+  } else if (/\b(more ice|more icy|icier|extra ice|strong(?:er)? (?:ice|cooling)|more cooling)\b/i.test(text)) {
+    if (merged.cooling === 'no_ice') merged.cooling = 'ice';
+    else merged.cooling = 'heavy_ice';
+  }
+
+  // Flavor intensity refine — keep type/cooling, nudge direction
+  if (/\bmore fruity\b|\bfruitier\b/i.test(text)) merged.flavorDirection = 'fruity';
+  if (/\bmore tropical\b/i.test(text)) merged.flavorDirection = 'tropical';
+  if (/\bmore citrus\b/i.test(text)) merged.flavorDirection = 'citrus';
+  if (/\bmore (?:candy|gummy)\b|\bcandy[- ]?like\b/i.test(text)) {
+    merged.flavorDirection = 'candy';
+    if (!merged.sweetness) merged.sweetness = 'sweet';
+  }
+  if (/\bmore menthol\b|\bmore mint\b/i.test(text)) {
+    merged.flavorDirection = 'menthol';
+    if (!merged.cooling || merged.cooling === 'no_ice') merged.cooling = 'ice';
+  }
+  if (/\bmore dessert\b/i.test(text)) merged.flavorDirection = 'dessert';
+
+  if (/\bsweeter\b|\bmore sweet\b/i.test(text)) merged.sweetness = 'sweet';
+  if (/\bless sweet\b|\bnot too sweet\b/i.test(text)) merged.sweetness = 'less_sweet';
+
+  if (clean) {
+    merged.rawHints = [...new Set([...(merged.rawHints || []), clean].filter(Boolean))].slice(-10);
+  }
+
+  return merged;
 }
 
 export function mergePreferences(previous = {}, incoming = {}) {
@@ -332,8 +390,12 @@ const FLAVOR_DIRECTION_RE = {
 /**
  * Filter inventory to products matching collected preferences.
  * Product type is a hard lock — never soft-fail into another category.
+ * @param {object[]} inventory
+ * @param {object} prefs
+ * @param {{ collapsePriority?: boolean }} [options]
  */
-export function filterInventoryByPreferences(inventory = [], prefs = {}) {
+export function filterInventoryByPreferences(inventory = [], prefs = {}, options = {}) {
+  const collapsePriority = options.collapsePriority !== false;
   let pool = Array.isArray(inventory) ? [...inventory] : [];
   if (!pool.length) return [];
 
@@ -360,7 +422,7 @@ export function filterInventoryByPreferences(inventory = [], prefs = {}) {
     if (noIce.length) pool = noIce;
   } else if (prefs.cooling === 'heavy_ice') {
     const heavy = pool.filter((p) =>
-      /\b(heavy ice|max ice|ultra ice|icy|frostbite|freeze)\b/i.test(productHaystack(p))
+      /\b(heavy ice|max ice|ultra ice|icy|frostbite|freeze|extra ice)\b/i.test(productHaystack(p))
     );
     if (heavy.length) pool = heavy;
     else {
@@ -374,14 +436,24 @@ export function filterInventoryByPreferences(inventory = [], prefs = {}) {
 
   if (prefs.sweetness === 'sweet') {
     const sweet = pool.filter((p) =>
-      /\b(sweet|candy|dessert|sugar|mango|strawberry)\b/i.test(productHaystack(p))
+      /\b(sweet|sweeter|candy|gummy|dessert|sugar|honey|mango|strawberry|watermelon|peach|grape)\b/i.test(
+        productHaystack(p)
+      )
     );
     if (sweet.length) pool = sweet;
+  } else if (prefs.sweetness === 'less_sweet') {
+    const lessSweet = pool.filter(
+      (p) => !/\b(candy|gummy|dessert|sugar|honey|very sweet)\b/i.test(productHaystack(p))
+    );
+    if (lessSweet.length) pool = lessSweet;
   }
 
-  // Prefer priority promotions when present — still within the type-locked pool
-  const priority = pool.filter((p) => p.isPriorityPromotion);
-  if (priority.length) return priority;
+  // Prefer priority promotions when present — still within the type-locked pool.
+  // Skip on refine so we can surface a different SKU than the sticky promo.
+  if (collapsePriority) {
+    const priority = pool.filter((p) => p.isPriorityPromotion);
+    if (priority.length) return priority;
+  }
 
   return pool;
 }

@@ -16,7 +16,7 @@ const NEW_PASS_RE =
 
 /** Explicit: user is tweaking the current recommendation */
 const REFINE_PASS_RE =
-  /\b(more ice|less ice|extra ice|heavy ice|strong(?:er)? ice|less cooling|more cooling|sweeter|less sweet|smoother|milder|stronger|another (flavor|variant|option)|different (flavor|variant|option)|something similar|similar (one|product|option)|same (kind|type|style|vibe)|don'?t like (this|that|the) flavor|i don'?t like this|not this flavor|make it (sweeter|icier|cooler|less sweet|less icy)|another option for (this|that)|suggest another (variant|option|flavor))\b/i;
+  /\b(more ice|less ice|extra ice|heavy ice|strong(?:er)? ice|less cooling|more cooling|icier|sweeter|less sweet|more sweet|smoother|milder|stronger(?: nicotine)?|more (?:fruity|tropical|citrus|candy|menthol|mint|dessert|berry)|fruitier|candy[- ]?like|another (flavor|variant|option)|different (flavor|variant|option)|something similar|similar (one|product|option)|same (kind|type|style|vibe)|don'?t like (this|that|the) flavor|i don'?t like this|not this flavor|make it (sweeter|icier|cooler|less sweet|less icy|more fruity)|another option for (this|that)|suggest another (variant|option|flavor)|stronger nicotine|more nicotine)\b/i;
 
 /**
  * Classify whether the user wants a new recommendation pass, a refine, or to continue collecting.
