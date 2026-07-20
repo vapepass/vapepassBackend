@@ -6,10 +6,12 @@ import { env } from '../config/env.js';
 import { ApiError } from '../utils/constants.js';
 import {
   buildSystemPrompt,
+  detectsConversationEnd,
   detectsRecommendationRestart,
   detectsUnderage,
   formatInventoryForPrompt,
   getComplianceMessages,
+  getConversationFarewell,
   interpretAgeReply,
   isProductReferencedInReply,
   buildInventoryFallbackReply,
@@ -180,17 +182,59 @@ export async function sendMessage(storeId, sessionKey, message, options = {}) {
     return lockSession(session, store, compliance, content, 'underage_tripwire');
   }
 
-  // Restart recommendation funnel
-  if (session.ageVerified && detectsRecommendationRestart(content)) {
-    store = (await ensureStoreTaxonomy(store._id)) || store;
+  // Polite closing after a recommendation — farewell, do not recommend again
+  const phaseBefore = session.funnelState?.phase || 'age';
+  if (
+    session.ageVerified &&
+    detectsConversationEnd(content) &&
+    (phaseBefore === 'recommendation' || phaseBefore === 'free_chat')
+  ) {
     session.messages.push({ role: 'user', content });
-    const started = await resetFunnel(store, session);
-    session.messages.push({ role: 'assistant', content: started.reply });
+    const reply = getConversationFarewell(store.name);
+    session.funnelState = {
+      ...(session.funnelState || {}),
+      phase: 'free_chat',
+      preferences: null,
+      preferenceHints: [],
+      lastAsked: null,
+      askAttempts: {},
+      lastAskText: null,
+      candidateProductIds: [],
+    };
+    session.messages.push({ role: 'assistant', content: reply });
     session.lastMessageAt = new Date();
     await session.save();
     return {
       ...serializeSession(session, store, compliance),
+      reply,
+      replyType: 'text',
+      options: [],
+      products: [],
+      locked: false,
+      conversationEnded: true,
+    };
+  }
+
+  // "Another recommendation" / start fresh — ALWAYS reopen discovery. Never auto-recommend.
+  if (session.ageVerified && detectsRecommendationRestart(content)) {
+    store = (await ensureStoreTaxonomy(store._id)) || store;
+    session.messages.push({ role: 'user', content });
+
+    const started = await resetFunnel(store, session, { freshRestart: true });
+
+    session.messages.push({ role: 'assistant', content: started.reply });
+    session.lastMessageAt = new Date();
+    await session.save();
+
+    console.log(`[assistant] fresh recommendation discovery started for store=${store._id}`);
+
+    return {
+      ...serializeSession(session, store, compliance),
       ...started,
+      // Hard guarantee — no product card on restart
+      products: [],
+      options: [],
+      replyType: 'text',
       locked: false,
       recommendationRestart: true,
     };

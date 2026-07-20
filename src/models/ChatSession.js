@@ -100,6 +100,8 @@ const chatSessionSchema = new mongoose.Schema(
         },
         /** Last clarification / follow-up text (avoids identical repeats) */
         lastAskText: { type: String, default: null },
+        /** Product ids already recommended in this chat — excluded on "another" / new passes */
+        excludedProductIds: [{ type: String }],
       },
       default: () => ({
         phase: 'age',
@@ -113,6 +115,7 @@ const chatSessionSchema = new mongoose.Schema(
         lastAsked: null,
         askAttempts: {},
         lastAskText: null,
+        excludedProductIds: [],
       }),
     },
     lastMessageAt: {

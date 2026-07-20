@@ -375,7 +375,8 @@ export function assessOptionMatch(userMessage, options = []) {
 
 export function isConfidentRefinementPhrase(message) {
   const t = foldText(message);
-  return /\b(sweeter|less sweet|more ice|less ice|no ice|heavy ice|extra ice|stronger|milder|smoother|another recommendation|something else|different (one|flavor|option)|no menthol|without menthol)\b/.test(
+  // Do NOT treat "another recommendation" / "something else" as refine — those start a new pass
+  return /\b(sweeter|less sweet|more ice|less ice|no ice|heavy ice|extra ice|stronger|milder|smoother|different (flavor|option|variant)|no menthol|without menthol|something similar|another (flavor|variant|option))\b/.test(
     t
   );
 }

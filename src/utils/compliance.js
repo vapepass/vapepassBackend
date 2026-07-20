@@ -211,6 +211,108 @@ export function getComplianceMessages(store) {
 }
 
 /**
+ * Normalize user text for conversation-end intent (punctuation, spacing, thank-you variants).
+ */
+export function normalizeConversationEndText(message) {
+  let text = String(message || '')
+    .toLowerCase()
+    // Strip frontend enrichment like "thank you (E-Liquid, Candy, Ice)"
+    .replace(/\s*\([^)]*\)\s*$/g, '')
+    .replace(/[“”"']/g, '')
+    .replace(/[!?.,;:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!text) return '';
+
+  // Synonym / shorthand collapsing for gratitude
+  text = text
+    .replace(/\bthankyou\b/g, 'thank you')
+    .replace(/\bthank\s*u\b/g, 'thank you')
+    .replace(/\bthank\s*ya\b/g, 'thank you')
+    .replace(/\bthx\b/g, 'thanks')
+    .replace(/\bty\b/g, 'thanks')
+    .replace(/\btysm\b/g, 'thanks')
+    .replace(/\bthank\s+you\b/g, 'thank you');
+
+  return text;
+}
+
+/**
+ * Detects polite conversation endings / "I'm done" after a recommendation.
+ * Must not be treated as refine or another-product intent.
+ */
+export function detectsConversationEnd(message) {
+  const raw = String(message || '').trim();
+  if (!raw) return false;
+
+  const text = normalizeConversationEndText(raw);
+  if (!text) return false;
+
+  // Clear shopping / refine intent — not a closing
+  if (
+    /\b(another recomm\w*|something else|start over|start fresh|show me another|looking for|more ice|less ice|sweeter|different flavor|disposable|e-?liquid|fruity|menthol)\b/i.test(
+      text
+    )
+  ) {
+    return false;
+  }
+  // "recommend something else" is restart; bare "recommend" alone is rare — only block with object
+  if (/\brecommend (another|something|a |an |me )\b/i.test(text)) {
+    return false;
+  }
+
+  // Gratitude (with or without fillers)
+  if (
+    /^(ok|okay|alright|all right|cool|great|perfect|awesome|nice|yes|yeah|yep)?\s*(thanks|thank you)(\s+(so much|a lot|very much))?$/.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  if (/\b(thanks|thank you)(\s+(so much|a lot|very much))?\b/.test(text) && text.split(/\s+/).length <= 8) {
+    return true;
+  }
+  if (/\b(appreciate it|appreciated|many thanks)\b/.test(text)) {
+    return true;
+  }
+
+  // Soft decline of further help
+  if (/\b(no thanks|no thank you|nah thanks|nope thanks)\b/.test(text)) {
+    return true;
+  }
+  if (/^(no|nope|nah)\s+(thanks|thank you)$/.test(text)) {
+    return true;
+  }
+
+  // Done / satisfied
+  if (
+    /\b(that'?s (all|it|perfect|great|fine|enough)|that is (all|it|perfect)|i'?m (good|done|all set|fine)|that will be all|all good|all set|i'?m all set)\b/.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  // Goodbye
+  if (/\b(goodbye|good bye|bye bye|bye|see you( later)?|take care|have a (good|great) (day|one))\b/.test(text)) {
+    return true;
+  }
+
+  // Short satisfied closers (only very short messages)
+  if (/^(perfect|awesome|great|sounds good|sounds perfect|all good)(\s+(thanks|thank you))?$/.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+export function getConversationFarewell(storeName = null) {
+  const storeBit = storeName ? ` at ${storeName}` : '';
+  return `Thank you for shopping with us${storeBit}! We hope you found the perfect product. We look forward to seeing you in person. Have a great day!`;
+}
+
+/**
  * Detects user intent to restart the recommendation flow (new flavor / another suggestion).
  * Does not alter the recommendation engine — only resets conversation context.
  */
@@ -218,12 +320,18 @@ export function detectsRecommendationRestart(message) {
   const text = String(message || '').trim().toLowerCase();
   if (!text) return false;
 
+  // Closings must win over broad "something else" / "i want another" false positives
+  if (detectsConversationEnd(text)) return false;
+
   return (
-    /\b(another recommendation|different (flavor|recommendation|one)|something else|start over|new recommendation|recommend (again|something else))\b/i.test(
+    /\b(another recomm\w*|different (flavor|recommendation|one|product)|something else|start over|start fresh|new recomm\w*|recommend (again|something else)|show me another product|recommend another vape|completely different|for my friend)\b/i.test(
       text
     ) ||
     /\bi want (another|a different|something else)\b/i.test(text) ||
-    /\bget another recommendation\b/i.test(text)
+    /\bget another recomm\w*\b/i.test(text) ||
+    /\bnow i want\b/i.test(text) ||
+    /\blet'?s start (over|again|fresh)\b/i.test(text) ||
+    /\bstart fresh\b/i.test(text)
   );
 }
 

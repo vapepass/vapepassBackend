@@ -12,6 +12,7 @@ import {
   looksLikeProductTypeStep,
   sanitizeUserHint,
 } from '../utils/nlu.js';
+import { detectsConversationEnd, detectsRecommendationRestart, getConversationFarewell } from '../utils/compliance.js';
 import {
   buildOpenShoppingPrompt,
   emptyPreferences,
@@ -23,6 +24,10 @@ import {
   applyContextualAnswer,
   buildContextualFollowUp,
 } from './preferenceConversation.service.js';
+import {
+  classifyRecommendationIntent,
+  resetRecommendationContext,
+} from './recommendationSession.service.js';
 
 export function matchOption(step, userMessage) {
   if (!step?.options?.length) return null;
@@ -477,13 +482,24 @@ async function completeVariantRecommendation(store, session, product, path = [])
     ? buildRecommendationText(product)
     : "I couldn't find a perfect match in stock right now. Tell me another preference and I'll try again.";
 
+  const prior = session.funnelState || {};
+  const excluded = new Set((prior.excludedProductIds || []).map(String));
+  if (product?._id) excluded.add(String(product._id));
+
   session.funnelState = {
     phase: 'recommendation',
     currentStepId: null,
     candidateProductIds: product ? [String(product._id)] : [],
-    parentExternalId: product?.parentExternalId || session.funnelState?.parentExternalId || null,
-    variantPath: session.funnelState?.variantPath || [],
+    parentExternalId: product?.parentExternalId || prior.parentExternalId || null,
+    variantPath: prior.variantPath || [],
     path,
+    // Keep prefs so "more ice" / refine can continue this pass
+    preferences: prior.preferences || emptyPreferences(),
+    preferenceHints: prior.preferenceHints || [],
+    lastAsked: null,
+    askAttempts: {},
+    lastAskText: null,
+    excludedProductIds: [...excluded].slice(-40),
   };
 
   return {
@@ -723,14 +739,60 @@ async function resolvePastBrandSteps(store, session, step, candidateIds, path) {
  * Preference-driven turn: extract NLP prefs → ask only what's missing → recommend.
  */
 async function advancePreferenceConversation(store, session, userMessage, inventory) {
-  const state = session.funnelState || {};
-  const lastAsked = state.lastAsked || null;
-  const askAttempts = { ...(state.askAttempts || {}) };
+  // Explicit "another recommendation" / start fresh — never skip discovery
+  if (detectsRecommendationRestart(userMessage)) {
+    return beginFunnel(store, session, { freshRestart: true });
+  }
 
-  let preferences = mergePreferences(
-    state.preferences || emptyPreferences(),
-    extractShoppingPreferences(userMessage)
-  );
+  // Closing messages must never re-run a recommendation with leftover prefs
+  if (detectsConversationEnd(userMessage)) {
+    const reply = getConversationFarewell(store.name);
+    session.funnelState = {
+      ...(session.funnelState || {}),
+      phase: 'free_chat',
+      preferences: null,
+      preferenceHints: [],
+      lastAsked: null,
+      askAttempts: {},
+      lastAskText: null,
+      candidateProductIds: [],
+    };
+    return {
+      reply,
+      replyType: 'text',
+      options: [],
+      products: [],
+      funnel: session.funnelState,
+      conversationEnded: true,
+    };
+  }
+
+  const state = session.funnelState || {};
+  const intentKind = classifyRecommendationIntent(userMessage, {
+    phase: state.phase,
+    preferences: state.preferences,
+  });
+
+  // Brand-new shopping statement (e.g. different product type) — discard prior pass memory
+  if (intentKind === 'new') {
+    const seeded = extractShoppingPreferences(userMessage);
+    resetRecommendationContext(session, {
+      seedPreferences: seeded,
+      phase: 'prefer',
+    });
+  }
+
+  const activeState = session.funnelState || state;
+  const lastAsked = intentKind === 'new' ? null : activeState.lastAsked || null;
+  const askAttempts = intentKind === 'new' ? {} : { ...(activeState.askAttempts || {}) };
+
+  let preferences =
+    intentKind === 'new'
+      ? mergePreferences(emptyPreferences(), extractShoppingPreferences(userMessage))
+      : mergePreferences(
+          activeState.preferences || emptyPreferences(),
+          extractShoppingPreferences(userMessage)
+        );
 
   // Interpret short answers in context of the question we just asked (e.g. "both" on ice)
   let contextual = applyContextualAnswer(userMessage, lastAsked, preferences);
@@ -744,6 +806,11 @@ async function advancePreferenceConversation(store, session, userMessage, invent
   preferences = mergePreferences(preferences, contextual.preferences);
   if (contextual.resolved && contextual.preferences?.cooling != null) {
     preferences.cooling = contextual.preferences.cooling;
+  }
+
+  // Refine after a completed card: apply deltas onto preserved prefs
+  if (intentKind === 'refine' && (state.phase === 'recommendation' || state.phase === 'free_chat')) {
+    preferences = mergePreferences(state.preferences || emptyPreferences(), preferences);
   }
 
   const hint = preferencesToHint(preferences);
@@ -770,7 +837,7 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       candidateProductIds: [],
       parentExternalId: null,
       variantPath: [],
-      path: state.path || [],
+      path: intentKind === 'new' ? [] : activeState.path || [],
       preferenceHints: preferences.rawHints || [],
       preferences,
       lastAsked: missing,
@@ -783,19 +850,54 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       options: [],
       products: [],
       funnel: session.funnelState,
+      recommendationPass: intentKind === 'new' ? 'new' : intentKind === 'refine' ? 'refine' : 'continue',
     };
   }
 
   const matched = filterInventoryByPreferences(inventory, preferences);
-  const pool =
-    matched.length > 0
-      ? matched
-      : filterInventoryByPreferences(inventory, {
-          ...preferences,
-          cooling: null,
-          sweetness: null,
-        });
-  const ids = (pool.length ? pool : inventory).slice(0, 80).map((p) => String(p._id));
+  // Never drop an explicit ice / no-ice requirement just to force a match
+  let pool = matched;
+  if (!pool.length) {
+    const relaxedSweet = filterInventoryByPreferences(inventory, {
+      ...preferences,
+      sweetness: null,
+    });
+    pool = relaxedSweet.length ? relaxedSweet : matched;
+  }
+
+  const excluded = new Set((activeState.excludedProductIds || []).map(String));
+  if (excluded.size && pool.length) {
+    const withoutPrev = pool.filter((p) => !excluded.has(String(p._id)));
+    if (withoutPrev.length) pool = withoutPrev;
+  }
+
+  const ids = (pool.length ? pool : inventory.filter((p) => !excluded.has(String(p._id))))
+    .slice(0, 80)
+    .map((p) => String(p._id));
+
+  // Still nothing after exclusions — ask instead of repeating the same card
+  if (!ids.length) {
+    const reply =
+      "I've already suggested the closest matches for that. Tell me a different product type, flavor, or ice preference and I'll search again.";
+    session.funnelState = {
+      phase: 'prefer',
+      preferences,
+      preferenceHints: preferences.rawHints || [],
+      excludedProductIds: [...excluded],
+      path: [],
+      candidateProductIds: [],
+      lastAsked: 'productType',
+      askAttempts: {},
+      lastAskText: reply,
+    };
+    return {
+      reply,
+      replyType: 'text',
+      options: [],
+      products: [],
+      funnel: session.funnelState,
+    };
+  }
 
   session.funnelState = {
     phase: 'prefer',
@@ -803,36 +905,30 @@ async function advancePreferenceConversation(store, session, userMessage, invent
     candidateProductIds: ids,
     parentExternalId: null,
     variantPath: [],
-    path: state.path || [],
+    path: intentKind === 'new' ? [] : activeState.path || [],
     preferenceHints: preferences.rawHints || [],
     preferences,
     lastAsked: null,
     askAttempts: {},
     lastAskText: null,
+    excludedProductIds: [...excluded],
   };
 
-  return finalizeRecommendation(store, session, ids, state.path || [], hint);
+  return finalizeRecommendation(store, session, ids, session.funnelState.path || [], hint);
 }
 
 /**
  * Start open preference conversation after age verification (not a fixed taxonomy tree).
+ * Always asks what the user wants — never auto-pushes a product card on open/restart.
+ * @param {{ freshRestart?: boolean }} [options]
  */
-export async function beginFunnel(store, session) {
+export async function beginFunnel(store, session, options = {}) {
   const inventory = await getRecommendableInventory(store._id);
-
-  if (inventory.length <= 2) {
-    const ids = inventory.map((p) => String(p._id));
-    if (ids.length) {
-      session.funnelState = {
-        phase: 'prefer',
-        preferences: emptyPreferences(),
-        preferenceHints: [],
-        candidateProductIds: ids,
-        path: [],
-      };
-      return finalizeRecommendation(store, session, ids, []);
-    }
-  }
+  // Keep prior exclusions so a full new pass is less likely to repeat the last card,
+  // but clear all preference memory so discovery starts from scratch.
+  const excluded = options.freshRestart
+    ? []
+    : session.funnelState?.excludedProductIds || [];
 
   session.funnelState = {
     phase: 'prefer',
@@ -843,15 +939,25 @@ export async function beginFunnel(store, session) {
     path: [],
     preferenceHints: [],
     preferences: emptyPreferences(),
+    lastAsked: null,
+    askAttempts: {},
+    lastAskText: null,
+    excludedProductIds: excluded,
   };
 
   return {
-    reply: buildOpenShoppingPrompt(inventory, store.name),
+    reply: buildOpenShoppingPrompt(inventory, store.name, {
+      freshRestart: Boolean(options.freshRestart),
+    }),
     replyType: 'text',
     options: [],
     products: [],
     funnel: session.funnelState,
   };
+}
+
+export async function resetFunnel(store, session, options = {}) {
+  return beginFunnel(store, session, { freshRestart: true, ...options });
 }
 
 /**
@@ -874,13 +980,57 @@ export async function advanceFunnel(store, session, userMessage, inventory) {
     return advancePreferenceConversation(store, session, userMessage, inventory);
   }
 
-  // After a recommendation, keep helping via preference mode
+  // After a recommendation:
+  // - polite closing → farewell (never another product card)
+  // - "another recommendation" / start fresh → reopen discovery
+  // - refine → keep prefs and continue
+  // - new shopping detail → re-enter prefer with cleared/seeded prefs
   if (state.phase === 'recommendation' || state.phase === 'free_chat') {
-    session.funnelState = {
-      ...state,
-      phase: 'prefer',
-      preferences: state.preferences || emptyPreferences(),
-    };
+    if (detectsConversationEnd(userMessage)) {
+      const reply = getConversationFarewell(store.name);
+      session.funnelState = {
+        ...(session.funnelState || {}),
+        phase: 'free_chat',
+        preferences: null,
+        preferenceHints: [],
+        lastAsked: null,
+        askAttempts: {},
+        lastAskText: null,
+        candidateProductIds: [],
+      };
+      return {
+        reply,
+        replyType: 'text',
+        options: [],
+        products: [],
+        funnel: session.funnelState,
+        conversationEnded: true,
+      };
+    }
+
+    if (detectsRecommendationRestart(userMessage)) {
+      return beginFunnel(store, session, { freshRestart: true });
+    }
+
+    const intentKind = classifyRecommendationIntent(userMessage, {
+      phase: state.phase,
+      preferences: state.preferences,
+    });
+
+    if (intentKind === 'new') {
+      const extracted = extractShoppingPreferences(userMessage);
+      resetRecommendationContext(session, {
+        seedPreferences: extracted,
+        phase: 'prefer',
+      });
+    } else {
+      session.funnelState = {
+        ...state,
+        phase: 'prefer',
+        preferences: state.preferences || emptyPreferences(),
+        preferenceHints: state.preferenceHints || [],
+      };
+    }
     return advancePreferenceConversation(store, session, userMessage, inventory);
   }
 
@@ -1088,12 +1238,10 @@ export async function finalizeRecommendation(
     ? products
     : await StoreInventory.find({ storeId: store._id, isActive: true }).limit(50).lean();
 
-  const combinedHint = [
-    userHint,
-    ...(session.funnelState?.preferenceHints || []),
-  ]
-    .filter(Boolean)
-    .join(' | ');
+  const combinedHint =
+    userHint ||
+    preferencesToHint(session.funnelState?.preferences || {}) ||
+    (session.funnelState?.preferenceHints || []).slice(-3).join(' | ');
 
   const chosen = await pickBestProduct(store, pool, path, combinedHint);
 
@@ -1189,10 +1337,6 @@ async function pickBestProduct(store, pool, path, userHint) {
   }
 
   return candidates[0];
-}
-
-export async function resetFunnel(store, session) {
-  return beginFunnel(store, session);
 }
 
 export async function ensureStoreTaxonomy(storeId) {

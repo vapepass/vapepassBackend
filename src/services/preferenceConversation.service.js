@@ -9,6 +9,7 @@ import {
   normalizeText,
   sanitizeUserHint,
   foldText,
+  strongFuzzyMatch,
 } from '../utils/nlu.js';
 
 const LIQUID_LIKE = new Set(['e_liquid', 'disposable', 'prefilled', 'pod', 'pouch']);
@@ -44,30 +45,15 @@ export function summarizeInventoryOfferings(inventory = []) {
   return [...found];
 }
 
-export function buildOpenShoppingPrompt(inventory = [], storeName = null) {
-  const types = summarizeInventoryOfferings(inventory);
-  const labels = types.map((t) => TYPE_LABELS[t]).filter(Boolean);
-  const uniqueLabels = [...new Set(labels)];
-
-  const offeringLine = uniqueLabels.length
-    ? `We have different options available, including ${formatList(uniqueLabels)}, plus flavors across those categories.`
-    : 'We have a range of products and flavors available in this store.';
-
-  const storeBit = storeName ? ` at ${storeName}` : '';
+export function buildOpenShoppingPrompt(inventory = [], storeName = null, options = {}) {
+  const intro = options.freshRestart
+    ? ['Sure! Let’s find another product for you.', '']
+    : [];
 
   return [
-    `What are you looking for today${storeBit}?`,
-    '',
-    offeringLine,
-    '',
-    'You can tell me your preference in your own words — for example: fruity e-liquids, menthol, dessert flavors, disposable vapes, pods, accessories, something icy, or a mango/strawberry vibe.',
+    ...intro,
+    "What are you looking for today? We carry E-Liquids, Disposables, Devices, Pods, and more. Just tell me what you're craving—like fruity, icy, or dessert flavors, a specific brand, or a disposable vibe—and I'll find it for you!",
   ].join('\n');
-}
-
-function formatList(items) {
-  if (items.length <= 1) return items[0] || 'products';
-  if (items.length === 2) return `${items[0]} and ${items[1]}`;
-  return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
 }
 
 /**
@@ -123,7 +109,14 @@ export function extractShoppingPreferences(message) {
     prefs.flavorDirection = 'dessert';
   } else if (hasToken('candy') || hasToken('gummy')) {
     prefs.flavorDirection = 'candy';
-  } else if (hasToken('fruity') || hasToken('fruit') || hasToken('fruits') || hasConcept('fruity')) {
+  } else if (
+    hasToken('fruity') ||
+    hasToken('fruit') ||
+    hasToken('fruits') ||
+    hasConcept('fruity') ||
+    // typo tolerance: fuity, fruty, fruitty, etc.
+    [...tokens].some((tok) => strongFuzzyMatch(tok, 'fruity') || strongFuzzyMatch(tok, 'fruit'))
+  ) {
     prefs.flavorDirection = 'fruity';
   } else if (hasToken('mango')) {
     prefs.flavorDirection = 'tropical';
@@ -381,9 +374,17 @@ export function summarizeCollectedPreferences(prefs = {}) {
     parts.push(p.specificFlavors.join('/'));
   }
   const typeLabel = p.productType ? TYPE_LABELS[p.productType] || p.productType : null;
-  if (!parts.length && typeLabel) return `a ${typeLabel.toLowerCase()} option`;
-  if (parts.length && typeLabel) {
-    return `a ${parts.join(' ')} ${typeLabel.toLowerCase().replace(/s$/, '')}`;
+  const typeSingular = typeLabel
+    ? typeLabel.toLowerCase().replace(/s$/, '').replace(/e-liquid$/, 'e-liquid')
+    : null;
+  const articleFor = (word) => (/^[aeiou]/i.test(String(word || '')) ? 'an' : 'a');
+
+  if (!parts.length && typeSingular) {
+    return `${articleFor(typeSingular)} ${typeSingular} option`;
+  }
+  if (parts.length && typeSingular) {
+    const phrase = `${parts.join(' ')} ${typeSingular}`;
+    return `${articleFor(parts[0])} ${phrase}`;
   }
   if (parts.length) return parts.join(' ');
   return null;
