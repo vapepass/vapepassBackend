@@ -18,6 +18,7 @@ import {
 } from '../utils/compliance.js';
 import { getAgeYesLabel, resolveStoreLegalAge } from '../utils/legalAge.js';
 import { canServeChatbot } from '../utils/subscriptionAccess.js';
+import { getStoreAllowedHostname } from '../utils/domain.js';
 import { getRecommendableInventory } from './inventory.service.js';
 import {
   advanceFunnel,
@@ -76,6 +77,8 @@ export async function getWidgetConfig(storeId, options = {}) {
         : productCount === 0
           ? 'no_inventory'
           : null,
+    /** Hostname this store’s embed script is authorized for (from website URL). */
+    allowedHostname: getStoreAllowedHostname(store),
     productCount,
     syncing: store.inventorySyncStatus === 'syncing' || store.inventorySyncStatus === 'pending',
   };

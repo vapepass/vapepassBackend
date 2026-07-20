@@ -37,6 +37,25 @@
   }
   CLIENT_URL = String(CLIENT_URL).replace(/\/+$/, '');
 
+  var pageHost = '';
+  try {
+    pageHost = window.location.hostname || '';
+  } catch (e) {
+    pageHost = '';
+  }
+  var clientLooksLocal = /localhost|127\.0\.0\.1/i.test(CLIENT_URL);
+  var pageIsLocal =
+    pageHost === 'localhost' || pageHost === '127.0.0.1' || /\.localhost$/i.test(pageHost);
+
+  if (clientLooksLocal && !pageIsLocal) {
+    console.error(
+      '[VapePass Assistant] CLIENT_URL on the API is still a local address (' +
+        CLIENT_URL +
+        '). Set Railway CLIENT_URL to your live Vercel frontend (https://…) and redeploy, ' +
+        'or override with data-client-url on the script tag.'
+    );
+  }
+
   var AGE_GATE_KEY = 'vapepass_site_age_verified';
 
   /**

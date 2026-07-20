@@ -36,6 +36,17 @@ export function normalizeHostname(hostname) {
 }
 
 /**
+ * True for local development hosts (Live Server, Next.js, etc.).
+ * @param {string|null|undefined} host
+ * @returns {boolean}
+ */
+export function isLocalDevHost(host) {
+  if (!host) return false;
+  const h = normalizeHostname(host);
+  return h === 'localhost' || h === '127.0.0.1' || Boolean(h && h.endsWith('.localhost'));
+}
+
+/**
  * Resolve the allowed hostname for a store from its website / product URL.
  * @param {{ productPageUrl?: string|null, websiteUrl?: string|null, allowedHostname?: string|null }} store
  * @returns {string|null}
@@ -61,11 +72,11 @@ export function isOriginAllowedForStore(originOrReferer, store, options = {}) {
   if (!requestHost) return false;
 
   if (options.allowLocalhost !== false) {
-    const isLocal =
-      requestHost === 'localhost' ||
-      requestHost === '127.0.0.1' ||
-      requestHost.endsWith('.localhost');
-    if (isLocal) return true;
+    if (isLocalDevHost(requestHost)) return true;
+  } else if (isLocalDevHost(requestHost)) {
+    // Even when callers disable localhost for "strict" production checks,
+    // local test pages (Live Server / 127.0.0.1) must still work against a live API.
+    return true;
   }
 
   const extras = (options.extraHosts || [])

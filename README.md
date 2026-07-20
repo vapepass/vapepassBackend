@@ -261,7 +261,10 @@ Set these **Environment Variables** in the Railway service (`.env` is not deploy
 | `JWT_SECRET` | long random string |
 | `JWT_REFRESH_SECRET` | long random string |
 | `CLIENT_URL` | `https://vapepass.vercel.app` |
+| `API_PUBLIC_URL` | `https://your-app.up.railway.app` (used in embed script URLs) |
 | `NODE_ENV` | `production` |
+| `MARKETING_DEMO_HOSTS` | Optional: extra hosts for the marketing demo chatbot |
+| `EMBED_TEST_HOSTS` | Optional: extra hosts allowed for embed testing |
 | `RESEND_API_KEY` | **Recommended on Railway** — from [resend.com](https://resend.com) |
 | `EMAIL_FROM` | `VapePass <onboarding@resend.dev>` (test) or verified domain sender |
 | `SUPPORT_ADMIN_EMAIL` | Inbox that receives Free Setup notifications |
