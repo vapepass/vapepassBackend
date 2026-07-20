@@ -1,4 +1,5 @@
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import cors from 'cors';
@@ -7,6 +8,7 @@ import mongoose from 'mongoose';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
 import { configureCloudinary } from './config/cloudinary.js';
+import { env } from './config/env.js';
 import webhookRoutes from './routes/webhook.routes.js';
 import apiRoutes from './routes/index.js';
 import { notFoundHandler, errorHandler } from './middleware/errorHandler.js';
@@ -25,7 +27,7 @@ app.use(
     origin: (_origin, callback) => callback(null, true),
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Vapepass-Parent-Origin'],
   })
 );
 
@@ -54,12 +56,21 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Embeddable VapePass Assistant widget (Shadow DOM)
+// Embeddable VapePass Assistant — thin loader that iframes the Next.js chat UI
 app.get('/widget.js', (req, res) => {
-  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-  res.setHeader('Cache-Control', 'public, max-age=300');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.sendFile(path.join(__dirname, '../public/widget.js'));
+  const widgetPath = path.join(__dirname, '../public/widget.js');
+  fs.readFile(widgetPath, 'utf8', (err, source) => {
+    if (err) {
+      res.status(500).type('text/plain').send('Unable to load widget.js');
+      return;
+    }
+    const clientUrl = String(env.clientUrl || 'http://localhost:3000').replace(/\/+$/, '');
+    const body = source.replace(/__VAPEPASS_CLIENT_URL__/g, clientUrl);
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(body);
+  });
 });
 
 // Static assets (email logo, etc.)

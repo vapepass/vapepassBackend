@@ -52,7 +52,7 @@ export function buildWidgetScriptUrl() {
 
 export function buildEmbedCode(storeId) {
   // Widget stays hidden until the host site age gate sets age_verified / vapepass_site_age_verified.
-  // After that, the chatbot runs its own age check before any recommendations.
+  // After that, the loader iframes the Next.js /embed chat UI (same components as the marketing site).
   return `<script src="${buildWidgetScriptUrl()}" data-store-id="${storeId}" async></script>`;
 }
 

@@ -78,12 +78,36 @@ export function isOriginAllowedForStore(originOrReferer, store, options = {}) {
 }
 
 /**
+ * True when the request Origin is the VapePass marketing/client app (iframe host).
+ * @param {string|null|undefined} origin
+ * @param {string|null|undefined} clientUrl
+ * @returns {boolean}
+ */
+export function isClientAppOrigin(origin, clientUrl) {
+  const requestHost = extractHostname(origin);
+  const clientHost = extractHostname(clientUrl);
+  if (!requestHost || !clientHost) return false;
+  return normalizeHostname(requestHost) === normalizeHostname(clientHost);
+}
+
+/**
  * Pick the best available origin signal from an Express request.
+ * When the chat UI is loaded in an iframe on CLIENT_URL, prefer
+ * X-Vapepass-Parent-Origin (the merchant page) for domain checks.
  * @param {import('express').Request} req
+ * @param {{ clientUrl?: string }} [options]
  * @returns {string|null}
  */
-export function getRequestOrigin(req) {
+export function getRequestOrigin(req, options = {}) {
   const origin = req.get('origin');
+  const parentOrigin = req.get('x-vapepass-parent-origin');
+  const clientUrl = options.clientUrl;
+
+  // Embed iframe: browser Origin is CLIENT_URL; merchant site is in the custom header.
+  if (parentOrigin && clientUrl && isClientAppOrigin(origin, clientUrl)) {
+    return parentOrigin;
+  }
+
   if (origin) return origin;
 
   const referer = req.get('referer') || req.get('referrer');

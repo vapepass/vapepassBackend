@@ -69,7 +69,7 @@ export const requireValidEmbedAccess = asyncHandler(async (req, res, next) => {
     throw new ApiError(404, 'Store not found');
   }
 
-  const origin = getRequestOrigin(req);
+  const origin = getRequestOrigin(req, { clientUrl: env.clientUrl });
   const demoMode = isMarketingDemoOrigin(origin);
   const allowLocalhost = env.nodeEnv !== 'production';
   const originOptions = {
@@ -125,7 +125,7 @@ export const loadEmbedStore = asyncHandler(async (req, res, next) => {
     throw new ApiError(404, 'Store not found');
   }
 
-  const origin = getRequestOrigin(req);
+  const origin = getRequestOrigin(req, { clientUrl: env.clientUrl });
   const demoMode = isMarketingDemoOrigin(origin);
   const allowLocalhost = env.nodeEnv !== 'production';
   const originOptions = {

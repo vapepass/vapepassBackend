@@ -151,9 +151,9 @@ describe('Assistant API', () => {
   test('serves embeddable widget script with site age gate', async () => {
     const res = await request(app).get('/widget.js').expect(200);
     assert.match(res.headers['content-type'], /javascript/);
-    assert.match(res.text, /Shadow DOM|attachShadow/);
-    assert.match(res.text, /WARNING: Vaping products contain nicotine|healthWarning/);
+    assert.match(res.text, /iframe|\/embed\?storeId=/);
     assert.match(res.text, /waitForSiteAgeGate|vapepass_site_age_verified/);
+    assert.match(res.text, /vapepass-assistant/);
   });
 
   test('locks conversation on under 21 implication', async () => {
