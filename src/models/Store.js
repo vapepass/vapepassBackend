@@ -99,14 +99,17 @@ const storeSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
-    /** Authorized store website URL — embed script only works on this domain */
+    /** Authorized store website URL — inventory / setup reference */
     websiteUrl: {
       type: String,
       default: null,
       trim: true,
       maxlength: [2048, 'Website URL cannot exceed 2048 characters'],
     },
-    /** Normalized hostname derived from websiteUrl / productPageUrl for embed checks */
+    /**
+     * Single active hostname for embed authorization (no www.).
+     * Defaults from websiteUrl; can be changed in the dashboard for local/staging/production testing.
+     */
     allowedHostname: {
       type: String,
       default: null,
@@ -241,7 +244,7 @@ const storeSchema = new mongoose.Schema(
   }
 );
 
-/** Keep legalAge + allowedHostname in sync when related fields change */
+/** Keep legalAge synced; allowedHostname is independent once set (dashboard can change it). */
 storeSchema.pre('save', function (next) {
   if (
     this.isNew ||
@@ -252,22 +255,28 @@ storeSchema.pre('save', function (next) {
     this.legalAge = getLegalAge(this.country, this.province);
   }
 
-  if (
-    this.isNew ||
-    this.isModified('websiteUrl') ||
-    this.isModified('productPageUrl') ||
-    this.isModified('allowedHostname')
-  ) {
-    const sourceUrl = this.websiteUrl || this.productPageUrl;
-    if (sourceUrl) {
-      this.allowedHostname = extractHostname(sourceUrl);
-      if (!this.websiteUrl && this.productPageUrl) {
-        this.websiteUrl = this.productPageUrl;
-      }
-      if (!this.productPageUrl && this.websiteUrl) {
-        this.productPageUrl = this.websiteUrl;
-      }
+  // Keep websiteUrl / productPageUrl paired for inventory scraping
+  if (this.isNew || this.isModified('websiteUrl') || this.isModified('productPageUrl')) {
+    if (!this.websiteUrl && this.productPageUrl) {
+      this.websiteUrl = this.productPageUrl;
     }
+    if (!this.productPageUrl && this.websiteUrl) {
+      this.productPageUrl = this.websiteUrl;
+    }
+  }
+
+  // Explicit authorized-domain update from dashboard — normalize to hostname only
+  if (this.isModified('allowedHostname') && this.allowedHostname) {
+    const normalized = extractHostname(this.allowedHostname);
+    if (normalized) {
+      this.allowedHostname = normalized;
+    }
+  } else if (
+    !this.allowedHostname &&
+    (this.websiteUrl || this.productPageUrl)
+  ) {
+    // Default authorized domain from store website when none is set yet
+    this.allowedHostname = extractHostname(this.websiteUrl || this.productPageUrl);
   }
 
   next();

@@ -1,6 +1,7 @@
 import Store from '../models/Store.js';
 import { getLegalAge } from '../utils/legalAge.js';
 import { ApiError } from '../utils/constants.js';
+import { extractHostname } from '../utils/domain.js';
 import * as passkitService from './passkit.service.js';
 
 export const getStoreByUser = async (user) => {
@@ -27,6 +28,7 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
     'stampGoal',
     'productPageUrl',
     'websiteUrl',
+    'allowedHostname',
     'address',
     'city',
     'country',
@@ -67,6 +69,19 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
       data.websiteUrl = data.productPageUrl;
     }
     data.inventorySyncStatus = 'pending';
+  }
+
+  // Authorized embed domain — replaces the previous one (single active hostname).
+  // Accepts full URLs (http://localhost:3000) or bare hosts (staging.example.com).
+  if (data.allowedHostname !== undefined) {
+    const hostname = extractHostname(data.allowedHostname);
+    if (!hostname) {
+      throw new ApiError(
+        400,
+        'Invalid authorized domain. Enter a URL or hostname (e.g. https://mystore.com or localhost).'
+      );
+    }
+    data.allowedHostname = hostname;
   }
 
   if (logoFile) {

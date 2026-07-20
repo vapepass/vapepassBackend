@@ -39,6 +39,12 @@ export const storeSettingsValidator = [
     .isLength({ max: 2048 })
     .withMessage('Website URL cannot exceed 2048 characters'),
 
+  body('allowedHostname')
+    .optional({ values: 'falsy' })
+    .trim()
+    .isLength({ max: 2048 })
+    .withMessage('Authorized domain cannot exceed 2048 characters'),
+
   body('address')
     .optional({ values: 'falsy' })
     .trim()

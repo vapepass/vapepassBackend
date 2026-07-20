@@ -5,7 +5,6 @@ import {
   extractHostname,
   getRequestOrigin,
   getStoreAllowedHostname,
-  isLocalDevHost,
   isOriginAllowedForStore,
   normalizeHostname,
 } from '../utils/domain.js';
@@ -13,23 +12,18 @@ import { canServeChatbot, hasServiceableSubscription } from '../utils/subscripti
 import { asyncHandler } from './asyncHandler.js';
 
 /**
- * Origins that may run the marketing-site demo chatbot or local embed tests.
- * Local hosts are always allowed — browsers only send them for truly local pages.
+ * Origins that may run the marketing-site demo chatbot (CLIENT_URL / configured hosts).
+ * Store embeds still require the store's single authorized hostname unless demo mode applies.
  */
 function isMarketingDemoOrigin(origin) {
   const host = extractHostname(origin);
   if (!host) return false;
-
-  if (isLocalDevHost(host)) {
-    return true;
-  }
 
   const clientHost = extractHostname(env.clientUrl);
   if (clientHost && normalizeHostname(host) === normalizeHostname(clientHost)) {
     return true;
   }
 
-  // Extra marketing / preview / test hosts (comma-separated)
   const extra = [
     ...env.marketingDemoHosts,
     ...String(process.env.MARKETING_DEMO_HOSTS || '')
@@ -45,7 +39,6 @@ function isMarketingDemoOrigin(origin) {
     return true;
   }
 
-  // Vercel preview deployments of the marketing site when CLIENT_URL host is also on Vercel
   if (
     clientHost &&
     clientHost.endsWith('.vercel.app') &&
@@ -54,7 +47,27 @@ function isMarketingDemoOrigin(origin) {
     return true;
   }
 
+  // Local marketing/demo host during development only
+  if (env.nodeEnv !== 'production') {
+    return host === 'localhost' || host === '127.0.0.1' || host.endsWith('.localhost');
+  }
+
   return false;
+}
+
+function buildOriginOptions() {
+  return {
+    allowLocalhost: env.nodeEnv !== 'production',
+    extraHosts: [
+      env.clientUrl,
+      env.apiPublicUrl,
+      ...(env.marketingDemoHosts || []),
+      ...String(process.env.EMBED_TEST_HOSTS || '')
+        .split(',')
+        .map((h) => h.trim())
+        .filter(Boolean),
+    ].filter(Boolean),
+  };
 }
 
 /**
@@ -78,19 +91,7 @@ export const requireValidEmbedAccess = asyncHandler(async (req, res, next) => {
 
   const origin = getRequestOrigin(req, { clientUrl: env.clientUrl });
   const demoMode = isMarketingDemoOrigin(origin);
-  const originOptions = {
-    // Local hosts are always permitted for embed testing (Live Server, etc.).
-    allowLocalhost: true,
-    extraHosts: [
-      env.clientUrl,
-      env.apiPublicUrl,
-      ...(env.marketingDemoHosts || []),
-      ...String(process.env.EMBED_TEST_HOSTS || '')
-        .split(',')
-        .map((h) => h.trim())
-        .filter(Boolean),
-    ].filter(Boolean),
-  };
+  const originOptions = buildOriginOptions();
 
   if (!demoMode && !hasServiceableSubscription(store)) {
     throw new ApiError(402, 'This store subscription is inactive. Chatbot unavailable.', {
@@ -98,12 +99,14 @@ export const requireValidEmbedAccess = asyncHandler(async (req, res, next) => {
     });
   }
 
-  // In production, Origin/Referer must match the store website (or marketing/demo/local host).
   if (env.nodeEnv === 'production') {
     if (!origin) {
       throw new ApiError(403, 'Unauthorized embed origin', { code: 'ORIGIN_REQUIRED' });
     }
-    if (!demoMode && !isOriginAllowedForStore(origin, store, originOptions)) {
+    if (
+      !demoMode &&
+      !isOriginAllowedForStore(origin, store, { ...originOptions, allowLocalhost: false })
+    ) {
       throw new ApiError(403, 'Embedding is not authorized for this website', {
         code: 'ORIGIN_NOT_ALLOWED',
         allowedHostname: getStoreAllowedHostname(store),
@@ -140,18 +143,7 @@ export const loadEmbedStore = asyncHandler(async (req, res, next) => {
 
   const origin = getRequestOrigin(req, { clientUrl: env.clientUrl });
   const demoMode = isMarketingDemoOrigin(origin);
-  const originOptions = {
-    allowLocalhost: true,
-    extraHosts: [
-      env.clientUrl,
-      env.apiPublicUrl,
-      ...(env.marketingDemoHosts || []),
-      ...String(process.env.EMBED_TEST_HOSTS || '')
-        .split(',')
-        .map((h) => h.trim())
-        .filter(Boolean),
-    ].filter(Boolean),
-  };
+  const originOptions = buildOriginOptions();
 
   if (origin && !demoMode) {
     const allowed = isOriginAllowedForStore(origin, store, originOptions);

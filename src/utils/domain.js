@@ -59,7 +59,8 @@ export function getStoreAllowedHostname(store) {
 
 /**
  * Check whether a request Origin/Referer matches the store's allowed website.
- * Localhost / 127.0.0.1 are allowed in non-production for development embeds.
+ * Localhost is only allowed when options.allowLocalhost is true (non-production),
+ * OR when the store's authorized domain itself is a local host.
  * Optional extraHosts (e.g. marketing site) may also be allowed for demos.
  * @param {string|null|undefined} originOrReferer
  * @param {object} store
@@ -71,11 +72,12 @@ export function isOriginAllowedForStore(originOrReferer, store, options = {}) {
   const requestHost = extractHostname(originOrReferer);
   if (!requestHost) return false;
 
-  if (options.allowLocalhost !== false) {
-    if (isLocalDevHost(requestHost)) return true;
-  } else if (isLocalDevHost(requestHost)) {
-    // Even when callers disable localhost for "strict" production checks,
-    // local test pages (Live Server / 127.0.0.1) must still work against a live API.
+  // Match the store's single active authorized hostname first
+  if (allowed && requestHost === allowed) {
+    return true;
+  }
+
+  if (options.allowLocalhost !== false && isLocalDevHost(requestHost)) {
     return true;
   }
 
@@ -84,8 +86,7 @@ export function isOriginAllowedForStore(originOrReferer, store, options = {}) {
     .filter(Boolean);
   if (extras.includes(requestHost)) return true;
 
-  if (!allowed) return false;
-  return requestHost === allowed;
+  return false;
 }
 
 /**
