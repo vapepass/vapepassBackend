@@ -258,20 +258,63 @@ function productHaystack(product) {
     .toLowerCase();
 }
 
-function matchesProductType(product, productType) {
+/** Related catalog types that may satisfy a preference (never cross e-liquid ↔ disposable ↔ device). */
+const TYPE_COMPAT = {
+  e_liquid: new Set(['e_liquid']),
+  disposable: new Set(['disposable']),
+  device: new Set(['device']),
+  pod: new Set(['pod', 'prefilled', 'cartridge']),
+  prefilled: new Set(['prefilled', 'pod', 'cartridge']),
+  cartridge: new Set(['cartridge', 'pod', 'prefilled']),
+  accessory: new Set(['accessory', 'coil', 'battery']),
+  coil: new Set(['coil', 'accessory']),
+  battery: new Set(['battery', 'accessory']),
+  pouch: new Set(['pouch']),
+};
+
+const TYPE_HAYSTACK_RE = {
+  e_liquid: /\b(e-?liquids?|e-?juices?|salt\s*nic|nic\s*salt|freebase)\b/i,
+  disposable: /\bdisposables?\b/i,
+  device: /\b(devices?|kits?|mods?|starter\s*kit)\b/i,
+  pod: /\b(pods?|pod\s*system|pod\s*kit)\b/i,
+  prefilled: /\b(pre-?filled|prefilled\s*pods?)\b/i,
+  cartridge: /\bcartridges?\b/i,
+  accessory: /\b(accessories|accessor|charger|case)\b/i,
+  coil: /\bcoils?\b/i,
+  battery: /\bbatter(y|ies)\b/i,
+  pouch: /\bpouches?\b/i,
+};
+
+/**
+ * Strict product-type match. Structured productType wins; haystack is only used
+ * when the product is untyped/other — and never to cross into a conflicting type.
+ */
+export function matchesProductType(product, productType) {
   if (!productType) return true;
-  if (String(product.productType || '').toLowerCase() === productType) return true;
+
+  const wanted = String(productType).toLowerCase();
+  const actual = String(product.productType || '').toLowerCase();
+  const compatible = TYPE_COMPAT[wanted] || new Set([wanted]);
+
+  // Typed inventory row — enforce category strictly
+  if (actual && actual !== 'other') {
+    return compatible.has(actual);
+  }
+
+  // Untyped / other — infer from title/category, but reject clear conflicts
   const hay = productHaystack(product);
-  const map = {
-    e_liquid: /\be-?liquid|e-?juice|salt\s*nic|nic\s*salt/i,
-    disposable: /\bdisposables?\b/i,
-    device: /\b(device|kit|mod)\b/i,
-    pod: /\bpod\b/i,
-    accessory: /\baccessor|coil|charger|case\b/i,
-    pouch: /\bpouch/i,
-    prefilled: /\bprefilled|pre-filled\b/i,
-  };
-  return map[productType] ? map[productType].test(hay) : true;
+  if (wanted !== 'e_liquid' && TYPE_HAYSTACK_RE.e_liquid.test(hay) && !TYPE_HAYSTACK_RE.pod.test(hay)) {
+    return false;
+  }
+  if (wanted !== 'disposable' && TYPE_HAYSTACK_RE.disposable.test(hay)) {
+    return false;
+  }
+  if (wanted === 'e_liquid' && (TYPE_HAYSTACK_RE.disposable.test(hay) || TYPE_HAYSTACK_RE.device.test(hay))) {
+    return false;
+  }
+
+  const re = TYPE_HAYSTACK_RE[wanted];
+  return re ? re.test(hay) : compatible.has(actual);
 }
 
 const FLAVOR_DIRECTION_RE = {
@@ -288,14 +331,16 @@ const FLAVOR_DIRECTION_RE = {
 
 /**
  * Filter inventory to products matching collected preferences.
+ * Product type is a hard lock — never soft-fail into another category.
  */
 export function filterInventoryByPreferences(inventory = [], prefs = {}) {
   let pool = Array.isArray(inventory) ? [...inventory] : [];
   if (!pool.length) return [];
 
   if (prefs.productType) {
-    const typed = pool.filter((p) => matchesProductType(p, prefs.productType));
-    if (typed.length) pool = typed;
+    pool = pool.filter((p) => matchesProductType(p, prefs.productType));
+    // Hard lock: empty means "nothing in this category", not "use full catalog"
+    if (!pool.length) return [];
   }
 
   if (prefs.specificFlavors?.length) {
@@ -326,14 +371,15 @@ export function filterInventoryByPreferences(inventory = [], prefs = {}) {
     const icy = pool.filter((p) => /\b(ice|iced|frost|menthol|cool|chill)\b/i.test(productHaystack(p)));
     if (icy.length) pool = icy;
   }
-  // cooling === 'any' → do not filter by ice
 
   if (prefs.sweetness === 'sweet') {
-    const sweet = pool.filter((p) => /\b(sweet|candy|dessert|sugar|mango|strawberry)\b/i.test(productHaystack(p)));
+    const sweet = pool.filter((p) =>
+      /\b(sweet|candy|dessert|sugar|mango|strawberry)\b/i.test(productHaystack(p))
+    );
     if (sweet.length) pool = sweet;
   }
 
-  // Prefer priority promotions when present
+  // Prefer priority promotions when present — still within the type-locked pool
   const priority = pool.filter((p) => p.isPriorityPromotion);
   if (priority.length) return priority;
 

@@ -854,31 +854,69 @@ async function advancePreferenceConversation(store, session, userMessage, invent
     };
   }
 
-  const matched = filterInventoryByPreferences(inventory, preferences);
-  // Never drop an explicit ice / no-ice requirement just to force a match
-  let pool = matched;
-  if (!pool.length) {
-    const relaxedSweet = filterInventoryByPreferences(inventory, {
-      ...preferences,
-      sweetness: null,
+  const typeLabel =
+    {
+      e_liquid: 'E-Liquids',
+      disposable: 'Disposable Vapes',
+      device: 'Devices & Kits',
+      pod: 'Pod Systems',
+      prefilled: 'Prefilled Pods',
+      accessory: 'Accessories',
+    }[preferences.productType] || preferences.productType || 'that category';
+
+  // Strict category filter first
+  let pool = filterInventoryByPreferences(inventory, preferences);
+
+  // If flavor/cooling narrowed to zero, relax those — but NEVER the product type
+  if (!pool.length && preferences.productType) {
+    pool = filterInventoryByPreferences(inventory, {
+      productType: preferences.productType,
+      flavorDirection: preferences.flavorDirection,
+      specificFlavors: preferences.specificFlavors,
     });
-    pool = relaxedSweet.length ? relaxedSweet : matched;
+  }
+  if (!pool.length && preferences.productType) {
+    pool = filterInventoryByPreferences(inventory, {
+      productType: preferences.productType,
+    });
+  }
+
+  if (!pool.length) {
+    const reply = preferences.productType
+      ? `I couldn't find a matching ${typeLabel.toLowerCase()} option for those preferences in this store's inventory. Want to try a different flavor, or a different product type?`
+      : "I couldn't find a match for those preferences. Tell me another product type or flavor and I'll search again.";
+    session.funnelState = {
+      phase: 'prefer',
+      preferences,
+      preferenceHints: preferences.rawHints || [],
+      path: [],
+      candidateProductIds: [],
+      excludedProductIds: activeState.excludedProductIds || [],
+      lastAsked: preferences.productType ? 'flavor' : 'productType',
+      askAttempts: {},
+      lastAskText: reply,
+    };
+    return {
+      reply,
+      replyType: 'text',
+      options: [],
+      products: [],
+      funnel: session.funnelState,
+    };
   }
 
   const excluded = new Set((activeState.excludedProductIds || []).map(String));
-  if (excluded.size && pool.length) {
+  if (excluded.size) {
     const withoutPrev = pool.filter((p) => !excluded.has(String(p._id)));
     if (withoutPrev.length) pool = withoutPrev;
   }
 
-  const ids = (pool.length ? pool : inventory.filter((p) => !excluded.has(String(p._id))))
-    .slice(0, 80)
-    .map((p) => String(p._id));
+  const ids = pool.slice(0, 80).map((p) => String(p._id));
 
-  // Still nothing after exclusions — ask instead of repeating the same card
+  // Still nothing after exclusions — ask instead of crossing categories
   if (!ids.length) {
     const reply =
-      "I've already suggested the closest matches for that. Tell me a different product type, flavor, or ice preference and I'll search again.";
+      "I've already suggested the closest matches in that category. Tell me a different flavor or product type and I'll search again.";
     session.funnelState = {
       phase: 'prefer',
       preferences,
@@ -886,7 +924,7 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       excludedProductIds: [...excluded],
       path: [],
       candidateProductIds: [],
-      lastAsked: 'productType',
+      lastAsked: 'flavor',
       askAttempts: {},
       lastAskText: reply,
     };
