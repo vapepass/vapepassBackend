@@ -12,7 +12,7 @@ import {
   strongFuzzyMatch,
 } from '../utils/nlu.js';
 
-const LIQUID_LIKE = new Set(['e_liquid', 'disposable', 'prefilled', 'pod', 'pouch']);
+const LIQUID_LIKE = new Set(['e_liquid', 'disposable', 'prefilled', 'pouch']);
 
 const TYPE_LABELS = {
   e_liquid: 'E-Liquids',
@@ -29,18 +29,13 @@ const TYPE_LABELS = {
 
 /**
  * Summarize which product families exist in this store's inventory.
+ * Only count types that would actually match recommendations (same rules as search).
  */
 export function summarizeInventoryOfferings(inventory = []) {
   const found = new Set();
-  for (const p of inventory) {
-    const type = String(p.productType || '').toLowerCase();
-    if (type && TYPE_LABELS[type]) found.add(type);
-    const hay = `${p.category || ''} ${p.name || ''}`.toLowerCase();
-    if (/\be-?liquid|e-?juice|salt\s*nic/i.test(hay)) found.add('e_liquid');
-    if (/\bdisposables?\b/i.test(hay)) found.add('disposable');
-    if (/\baccessor/i.test(hay)) found.add('accessory');
-    if (/\bpod\b/i.test(hay)) found.add('pod');
-    if (/\bdevice|kit|mod\b/i.test(hay)) found.add('device');
+  const list = Array.isArray(inventory) ? inventory : [];
+  for (const type of Object.keys(TYPE_LABELS)) {
+    if (list.some((p) => matchesProductType(p, type))) found.add(type);
   }
   return [...found];
 }
@@ -50,9 +45,17 @@ export function buildOpenShoppingPrompt(inventory = [], storeName = null, option
     ? ['Sure! Let’s find another product for you.', '']
     : [];
 
+  const offerings = summarizeInventoryOfferings(inventory)
+    .map((t) => TYPE_LABELS[t])
+    .filter(Boolean);
+  const carry =
+    offerings.length > 0
+      ? offerings.slice(0, 5).join(', ')
+      : 'E-Liquids, Disposables, Devices, Pods, and more';
+
   return [
     ...intro,
-    "What are you looking for today? We carry E-Liquids, Disposables, Devices, Pods, and more. Just tell me what you're craving—like fruity, icy, or dessert flavors, or a specific brand—and I'll find it for you!",
+    `What are you looking for today? We carry ${carry}. Just tell me what you're craving—like fruity, icy, or dessert flavors, or a specific brand—and I'll find it for you!`,
   ].join('\n');
 }
 
@@ -78,14 +81,20 @@ export function extractShoppingPreferences(message) {
     rawHints: clean ? [clean] : [],
   };
 
-  // Product type
+  // Product type — more specific phrases before broad "pods"
   if (hasConcept('eliquid') || /\be[\s-]?liquids?\b|\be[\s-]?juices?\b|\bsalt\s*nic/i.test(clean)) {
     prefs.productType = 'e_liquid';
   } else if (hasConcept('disposable') || /\bdisposables?\b|\bdispo\b/i.test(clean)) {
     prefs.productType = 'disposable';
-  } else if (hasConcept('pod') || /\bpod\s*(system|kit|kits)?s?\b/i.test(clean)) {
+  } else if (/\bpre-?filled\b/i.test(clean) || /\bprefilled\s*pods?\b/i.test(clean)) {
+    prefs.productType = 'prefilled';
+  } else if (/\bpod\s*systems?\b/i.test(clean) || hasConcept('pod') || /\bpods?\b/i.test(clean)) {
     prefs.productType = 'pod';
-  } else if (hasConcept('device') || /\b(device|kit|mod|starter)\b/i.test(clean)) {
+  } else if (
+    hasConcept('device') ||
+    /\bdevices?\s*(?:&|and)?\s*kits?\b/i.test(clean) ||
+    /\b(device|kit|mod|starter)\b/i.test(clean)
+  ) {
     prefs.productType = 'device';
   } else if (/\baccessor/i.test(clean) || /\bcoils?\b/i.test(clean)) {
     prefs.productType = 'accessory';
@@ -231,14 +240,29 @@ export function mergePreferences(previous = {}, incoming = {}) {
   const prev = previous && typeof previous === 'object' ? previous : {};
   const next = { ...prev };
 
-  if (incoming.productType) next.productType = incoming.productType;
+  if (incoming.productType) {
+    const typeChanged = incoming.productType !== prev.productType;
+    next.productType = incoming.productType;
+    if (typeChanged) {
+      // Re-ask brand for the new category; drop liquid-only prefs for hardware
+      next.brand = incoming.brand || null;
+      if (!isLiquidLike(incoming.productType)) {
+        next.flavorDirection = null;
+        next.specificFlavors = [];
+        next.cooling = null;
+        next.sweetness = null;
+      }
+    }
+  }
   if (incoming.flavorDirection) next.flavorDirection = incoming.flavorDirection;
   if (incoming.cooling) next.cooling = incoming.cooling;
   if (incoming.sweetness) next.sweetness = incoming.sweetness;
   if (incoming.brand) next.brand = incoming.brand;
 
   const flavors = [
-    ...(Array.isArray(prev.specificFlavors) ? prev.specificFlavors : []),
+    ...(Array.isArray(prev.specificFlavors) && isLiquidLike(next.productType || prev.productType)
+      ? prev.specificFlavors
+      : []),
     ...(Array.isArray(incoming.specificFlavors) ? incoming.specificFlavors : []),
   ];
   next.specificFlavors = [...new Set(flavors)].slice(0, 8);
@@ -277,6 +301,16 @@ export function evaluatePreferenceCompleteness(prefs = {}, inventory = []) {
     };
   }
 
+  const typePool = (inventory || []).filter((item) => matchesProductType(item, p.productType));
+  if (!typePool.length) {
+    const label = TYPE_LABELS[p.productType] || p.productType || 'that category';
+    return {
+      ready: false,
+      missing: 'productType',
+      ask: `I don't currently have recommendable ${label} in this store's inventory. Want to try a different product type — e-liquids, disposables, pods, or accessories?`,
+    };
+  }
+
   const needsFlavor = isLiquidLike(p.productType);
   const hasFlavor =
     Boolean(p.flavorDirection) || (Array.isArray(p.specificFlavors) && p.specificFlavors.length > 0);
@@ -300,13 +334,13 @@ export function evaluatePreferenceCompleteness(prefs = {}, inventory = []) {
   // Brand preference — REQUIRED before any recommendation (never skip)
   if (p.brand == null || p.brand === '') {
     const examples = listInventoryBrands(inventory, p.productType, 5);
-    const exampleText = examples.length
-      ? `${examples.join(', ')}, or any other brand available in our inventory`
-      : 'ABT, Allo, STLTH, Vice, or any other brand available in our inventory';
+    const ask = examples.length
+      ? `Do you have a preferred brand? For example: ${examples.join(', ')}. You can also name another brand in stock, or reply with "No Preference."`
+      : `Do you have a preferred brand for this category? If not, simply reply with "No Preference" and I'll pick the best match from what's in stock.`;
     return {
       ready: false,
       missing: 'brand',
-      ask: `Do you have a preferred brand? For example: ${exampleText}. If you don't have a preference, simply reply with "No Preference."`,
+      ask,
     };
   }
 
@@ -315,11 +349,11 @@ export function evaluatePreferenceCompleteness(prefs = {}, inventory = []) {
 }
 
 const BRAND_NO_PREF_RE =
-  /\b(no preference|any brand|doesn't matter|doesnt matter|dont care|don't care|whatever|surprise me|you (pick|choose)|no brand)\b/i;
+  /\b(no preference|any brand|any other brand|other brands?|doesn't matter|doesnt matter|dont care|don't care|whatever|surprise me|you (pick|choose)|no brand)\b/i;
 
 /** Flavor / preference words that must never be treated as brand names */
 const FLAVOR_NOT_BRAND_RE =
-  /\b(fruit|fruity|ice|iced|icy|sweet|sweeter|dessert|candy|gummy|menthol|mint|minty|mango|berry|berries|citrus|tropical|melon|grape|peach|lemon|lime|orange|strawberry|blueberry|vanilla|tobacco|smooth|cooling|disposable|liquid|juice|pod|device|kit|accessory)\b/i;
+  /\b(fruit|fruity|ice|iced|icy|sweet|sweeter|dessert|candy|gummy|menthol|mint|minty|mango|berry|berries|citrus|tropical|melon|grape|peach|lemon|lime|orange|strawberry|blueberry|vanilla|tobacco|smooth|cooling|disposable|liquid|juice|accessory)\b/i;
 
 /**
  * Top brands in inventory (optionally scoped to a product type).
@@ -417,9 +451,11 @@ const TYPE_COMPAT = {
   e_liquid: new Set(['e_liquid']),
   disposable: new Set(['disposable']),
   device: new Set(['device']),
-  pod: new Set(['pod', 'prefilled', 'cartridge']),
-  prefilled: new Set(['prefilled', 'pod', 'cartridge']),
-  cartridge: new Set(['cartridge', 'pod', 'prefilled']),
+  // Pod systems / empty mesh pods — not flavored closed pods
+  pod: new Set(['pod']),
+  // Flavored closed pods only
+  prefilled: new Set(['prefilled']),
+  cartridge: new Set(['cartridge', 'pod']),
   accessory: new Set(['accessory', 'coil', 'battery']),
   coil: new Set(['coil', 'accessory']),
   battery: new Set(['battery', 'accessory']),
@@ -430,7 +466,8 @@ const TYPE_HAYSTACK_RE = {
   e_liquid: /\b(e-?liquids?|e-?juices?|salt\s*nic|nic\s*salt|freebase|refill)\b/i,
   disposable:
     /\b(disposables?|disposable\s*vapes?|puff\s*bar|vape\s*bar|\d{1,3}\s*k\s*puffs?|\d{1,3}(?:,\d{3})+\s*puffs?|up\s*to\s*\d[\d,]*\s*puffs?)\b/i,
-  device: /\b(devices?|kits?|mods?|starter\s*kit)\b/i,
+  device:
+    /\b(devices?|vape\s*kits?|starter\s*kits?|pod\s*kits?|box\s*mods?|mods?\b|kits?\b|aio|all[- ]in[- ]one)\b/i,
   pod: /\b(pods?|pod\s*system|pod\s*kit)\b/i,
   prefilled: /\b(pre-?filled|prefilled\s*pods?)\b/i,
   cartridge: /\bcartridges?\b/i,
@@ -466,6 +503,29 @@ function looksLikeHardwareOrEmptyCart(product) {
     if (TYPE_HAYSTACK_RE.e_liquid.test(hay) && !/\b(510|empty\s*cart|empty\s*cartridge|cartridges?)\b/i.test(hay)) {
       return false;
     }
+    return true;
+  }
+  return false;
+}
+
+const FLAVOR_SIGNAL_RE =
+  /\b(mango|berry|berries|strawberry|blueberry|raspberry|watermelon|grape|peach|lemon|lime|orange|citrus|mint|menthol|vanilla|tobacco|candy|gummy|dessert|fruity|fruit|ice|iced|tropical|melon|apple|banana|pineapple|coconut|cherry|cola|coffee)\b/i;
+
+/** Empty mesh / replacement pods — never treat as flavored prefilled pods */
+function looksLikeEmptyPodHardware(product) {
+  const hay = productHaystack(product);
+  if (/\b\d+(?:\.\d+)?\s*ohm\b/i.test(hay)) return true;
+  if (/\b(mesh\s*pod|empty\s*pod|replacement\s*pod|refillable\s*pod|pod\s*coil)\b/i.test(hay)) {
+    return true;
+  }
+  // Pod hardware with no flavor / prefilled language
+  if (
+    /\bpods?\b/i.test(hay) &&
+    !TYPE_HAYSTACK_RE.prefilled.test(hay) &&
+    !FLAVOR_SIGNAL_RE.test(hay) &&
+    !looksLikeDisposable(product) &&
+    /\b(device|kit|mod|ohm|mesh|coil|cartridge|atomizer|system)\b/i.test(hay)
+  ) {
     return true;
   }
   return false;
@@ -528,12 +588,44 @@ export function matchesProductType(product, productType) {
     return TYPE_HAYSTACK_RE.disposable.test(hay);
   }
 
+  // Flavored closed pods — never empty mesh / ohm replacement pods (even if mistyped)
+  if (wanted === 'prefilled') {
+    if (disposableSignal || eLiquidSignal || looksLikeEmptyPodHardware(product)) return false;
+    if (actual === 'prefilled') return true;
+    if (TYPE_HAYSTACK_RE.prefilled.test(hay)) return true;
+    if (FLAVOR_SIGNAL_RE.test(hay) && /\bpods?\b/i.test(hay)) return true;
+    return false;
+  }
+
+  // Pod systems / empty pods (hardware) — not flavored disposables or juice
+  if (wanted === 'pod') {
+    if (disposableSignal || eLiquidSignal) return false;
+    if (looksLikeEmptyPodHardware(product)) return true;
+    if (actual === 'pod') return true;
+    if (actual && actual !== 'other' && actual !== 'prefilled') return compatible.has(actual);
+    if (TYPE_HAYSTACK_RE.pod.test(hay) && !FLAVOR_SIGNAL_RE.test(hay)) return true;
+    return false;
+  }
+
   // Typed inventory row — enforce category strictly
   if (actual && actual !== 'other') {
     return compatible.has(actual);
   }
 
   // Untyped / other — infer from title/category
+  if (wanted === 'device') {
+    if (disposableSignal) return false;
+    if (eLiquidSignal && !TYPE_HAYSTACK_RE.device.test(hay)) return false;
+    // Empty carts / coils are not kits unless the title clearly says kit/device/mod
+    if (
+      /\b(510|empty\s*cart|empty\s*cartridge|cartridges?|coils?|drip\s*tips?)\b/i.test(hay) &&
+      !TYPE_HAYSTACK_RE.device.test(hay)
+    ) {
+      return false;
+    }
+    return TYPE_HAYSTACK_RE.device.test(hay);
+  }
+
   if (wanted !== 'e_liquid' && TYPE_HAYSTACK_RE.e_liquid.test(hay) && !TYPE_HAYSTACK_RE.pod.test(hay) && !disposableSignal) {
     return false;
   }
@@ -603,6 +695,18 @@ export function filterInventoryByPreferences(inventory = [], prefs = {}, options
     pool = pool.filter((p) => matchesProductType(p, prefs.productType));
     // Hard lock: empty means "nothing in this category", not "use full catalog"
     if (!pool.length) return [];
+  }
+
+  // Never recommend empty mesh pods when the shopper asked for a flavor
+  if (
+    (prefs.flavorDirection || (prefs.specificFlavors && prefs.specificFlavors.length)) &&
+    (prefs.productType === 'prefilled' || prefs.productType === 'pod')
+  ) {
+    const flavored = pool.filter(
+      (p) => !looksLikeEmptyPodHardware(p) && FLAVOR_SIGNAL_RE.test(productHaystack(p))
+    );
+    if (flavored.length) pool = flavored;
+    else if (prefs.productType === 'prefilled') return [];
   }
 
   // Brand hard lock — apply BEFORE flavor/cooling so we never substitute another brand

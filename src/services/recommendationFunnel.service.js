@@ -19,6 +19,7 @@ import {
   evaluatePreferenceCompleteness,
   extractShoppingPreferences,
   filterInventoryByPreferences,
+  listInventoryBrands,
   mergePreferences,
   preferencesToHint,
   applyContextualAnswer,
@@ -32,6 +33,10 @@ import {
   resetRecommendationContext,
 } from './recommendationSession.service.js';
 
+const LIQUID_LIKE_TYPES = new Set(['e_liquid', 'disposable', 'prefilled', 'pouch']);
+function isLiquidLikePreference(productType) {
+  return LIQUID_LIKE_TYPES.has(productType);
+}
 export function matchOption(step, userMessage) {
   if (!step?.options?.length) return null;
   const text = sanitizeUserHint(userMessage) || String(userMessage || '').trim();
@@ -953,23 +958,32 @@ async function advancePreferenceConversation(store, session, userMessage, invent
   }
 
   if (!pool.length) {
+    const liquidAsk = isLiquidLikePreference(preferences.productType);
+    const availableBrands = listInventoryBrands(inventory, preferences.productType, 5);
+    const brandHint = availableBrands.length
+      ? `Available brands for this category include: ${availableBrands.join(', ')}.`
+      : 'You can also say "No Preference" to browse anything in this category.';
     const reply = hasHardBrand
       ? [
-          `I couldn't find a matching ${typeLabel.toLowerCase()} from ${brandLabel} for those preferences in this store's inventory.`,
+          `I couldn't find a matching ${typeLabel.toLowerCase()} from ${brandLabel} in this store's inventory.`,
           '',
-          'Would you like to try another brand, say "No Preference" to browse any brand, or change the flavor / ice level?',
+          liquidAsk
+            ? `Would you like to try another brand, say "No Preference" to browse any brand, or change the flavor / ice level? ${brandHint}`
+            : `Would you like to try another brand, say "No Preference" to browse any brand, or pick a different product type? ${brandHint}`,
         ].join('\n')
       : preferences.productType
-        ? `I couldn't find a matching ${typeLabel.toLowerCase()} option for those preferences in this store's inventory. Want to try a different flavor, or a different product type?`
+        ? liquidAsk
+          ? `I couldn't find a matching ${typeLabel.toLowerCase()} option for those preferences in this store's inventory. Want to try a different flavor, or a different product type?`
+          : `I couldn't find a matching ${typeLabel.toLowerCase()} option in this store's inventory. Want to try a different product type?`
         : "I couldn't find a match for those preferences. Tell me another product type or flavor and I'll search again.";
     session.funnelState = {
       phase: 'prefer',
-      preferences,
+      preferences: hasHardBrand ? { ...preferences, brand: null } : preferences,
       preferenceHints: preferences.rawHints || [],
       path: [],
       candidateProductIds: [],
       excludedProductIds: activeState.excludedProductIds || [],
-      lastAsked: hasHardBrand ? 'brand' : preferences.productType ? 'flavor' : 'productType',
+      lastAsked: hasHardBrand ? 'brand' : preferences.productType ? (liquidAsk ? 'flavor' : 'productType') : 'productType',
       askAttempts: {},
       lastAskText: reply,
     };

@@ -112,9 +112,23 @@ export function inferProductType(extras = {}, textForSpecs = '') {
   }
   if (POUCH_HINT_RE.test(hay)) return 'pouch';
   if (POD_HINT_RE.test(hay)) {
+    // Empty / replacement mesh pods are hardware — not flavored closed pods
+    if (
+      /\b\d+(?:\.\d+)?\s*ohm\b/i.test(hay) ||
+      /\b(mesh\s*pod|empty\s*pod|replacement\s*pod|refillable\s*pod)\b/i.test(hay)
+    ) {
+      return 'pod';
+    }
+    if (/\bpre-?filled\b/i.test(hay)) return 'prefilled';
     const volumeMatch = textForSpecs.match(VOLUME_RE);
     const volumeMl = volumeMatch ? Number(volumeMatch[1]) : null;
-    return volumeMl != null && volumeMl <= 2 ? 'pod' : 'prefilled';
+    const flavorish =
+      /\b(mango|berry|strawberry|blueberry|watermelon|grape|peach|lemon|lime|orange|mint|menthol|vanilla|candy|ice|iced|tropical|melon|apple|banana|pineapple|coconut|cherry)\b/i.test(
+        hay
+      );
+    if (flavorish) return 'prefilled';
+    if (volumeMl != null && volumeMl <= 2) return 'pod';
+    return 'pod';
   }
   if (DEVICE_HINT_RE.test(hay)) return 'device';
   if (HARDWARE_HINT_RE.test(hay)) return 'accessory';
