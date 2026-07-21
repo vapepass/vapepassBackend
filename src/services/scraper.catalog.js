@@ -3,7 +3,10 @@ import { resolveSharedDescription, cleanDescription } from '../utils/description
 const NICOTINE_RE = /(\d+(?:\.\d+)?)\s*mg(?:\s*\/?\s*m[lL])?/i;
 const VOLUME_RE = /(\d+(?:\.\d+)?)\s*m[lL]\b/i;
 const POD_HINT_RE = /\b(pod|cartridge|pre[- ]?filled)\b/i;
-const DISPOSABLE_HINT_RE = /\b(disposable\s*vapes?|disposables?|puff\s*bar|vape\s*bar)\b/i;
+const DISPOSABLE_HINT_RE =
+  /\b(disposable\s*vapes?|disposables?|puff\s*bar|vape\s*bar|\d{1,3}\s*k\s*puffs?|\d{1,3}(?:,\d{3})+\s*puffs?|up\s*to\s*\d[\d,]*\s*puffs?)\b/i;
+const CARTRIDGE_HINT_RE =
+  /\b(510|empty\s*cart|empty\s*cartridge|cartridges?|atomizers?)\b/i;
 const DEVICE_HINT_RE =
   /\b(vape\s*kits?|starter\s*kits?|mods?\b|devices?|tanks?|atomizers?|box\s*mod)\b/i;
 const HARDWARE_HINT_RE =
@@ -87,9 +90,18 @@ export function sanitizeProductPageUrl(url) {
 }
 
 export function inferProductType(extras = {}, textForSpecs = '') {
-  if (extras.productType && extras.productType !== 'other') return extras.productType;
-
   const hay = `${extras.category || ''} ${extras.subcategory || ''} ${textForSpecs}`.toLowerCase();
+
+  // Disposables / empty carts first — often sit in wrong Shopify product_type buckets
+  if (DISPOSABLE_HINT_RE.test(hay)) return 'disposable';
+  if (CARTRIDGE_HINT_RE.test(hay)) return 'cartridge';
+
+  if (extras.productType && extras.productType !== 'other') {
+    // Override mis-labeled e_liquid when the title is clearly a disposable / empty cart
+    if (extras.productType === 'e_liquid' && DISPOSABLE_HINT_RE.test(hay)) return 'disposable';
+    if (extras.productType === 'e_liquid' && CARTRIDGE_HINT_RE.test(hay)) return 'cartridge';
+    return extras.productType;
+  }
 
   if (
     isELiquidCategoryName(extras.category) ||
@@ -99,7 +111,6 @@ export function inferProductType(extras = {}, textForSpecs = '') {
     return 'e_liquid';
   }
   if (POUCH_HINT_RE.test(hay)) return 'pouch';
-  if (DISPOSABLE_HINT_RE.test(hay)) return 'disposable';
   if (POD_HINT_RE.test(hay)) {
     const volumeMatch = textForSpecs.match(VOLUME_RE);
     const volumeMl = volumeMatch ? Number(volumeMatch[1]) : null;

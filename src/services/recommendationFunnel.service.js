@@ -24,6 +24,8 @@ import {
   applyContextualAnswer,
   applyRelativePreferenceDeltas,
   buildContextualFollowUp,
+  matchBrandPreference,
+  looksLikeExplicitBrandPhrase,
 } from './preferenceConversation.service.js';
 import {
   classifyRecommendationIntent,
@@ -818,6 +820,48 @@ async function advancePreferenceConversation(store, session, userMessage, invent
     if (contextual.resolved && contextual.preferences?.cooling != null) {
       preferences.cooling = contextual.preferences.cooling;
     }
+    if (contextual.resolved && contextual.preferences?.brand != null) {
+      preferences.brand = contextual.preferences.brand;
+    }
+  } else if (contextual.resolved && contextual.preferences?.brand != null) {
+    preferences.brand = contextual.preferences.brand;
+  }
+
+  // Resolve brand ONLY when answering the brand question (or an explicit "X brand" phrase).
+  // Never infer brand from flavor answers like "Mint" — that skipped the brand step.
+  if (lastAsked === 'brand') {
+    const brandHit = matchBrandPreference(userMessage, inventory, preferences.productType);
+    if (brandHit) {
+      preferences.brand = brandHit;
+    } else if (preferences.brand && preferences.brand !== 'any') {
+      const normalized = matchBrandPreference(
+        String(preferences.brand),
+        inventory,
+        preferences.productType
+      );
+      if (normalized) {
+        preferences.brand = normalized;
+      } else {
+        // Typed brand not in inventory list — keep it for soft filter, unless it's a flavor word
+        const typed = String(preferences.brand).trim();
+        if (/\b(fruit|fruity|ice|mint|menthol|sweet|dessert|candy|mango|berry|citrus|tropical)\b/i.test(typed)) {
+          preferences.brand = null;
+        }
+      }
+    } else {
+      // Unresolved brand answer — ask again (do not recommend yet)
+      preferences.brand = null;
+    }
+  } else if (looksLikeExplicitBrandPhrase(userMessage)) {
+    const brandHit = matchBrandPreference(userMessage, inventory, preferences.productType);
+    if (brandHit && brandHit !== 'any') {
+      preferences.brand = brandHit;
+    }
+  }
+
+  // Hard gate: never recommend until brand preference is collected
+  if (preferences.brand == null || preferences.brand === '') {
+    preferences = { ...preferences, brand: null };
   }
 
   const hint = preferencesToHint(preferences);
@@ -873,15 +917,18 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       accessory: 'Accessories',
     }[preferences.productType] || preferences.productType || 'that category';
 
-  // Strict category filter first.
+  // Strict category + brand filter first.
   // After a completed card (refine/continue), skip priority-only collapse and prefer a new SKU.
   const isRefine =
     intentKind === 'refine' || Boolean(activeState.fromCompletedRecommendation && intentKind !== 'new');
+  const hasHardBrand = Boolean(preferences.brand && preferences.brand !== 'any');
+  const brandLabel = hasHardBrand ? String(preferences.brand) : null;
+
   let pool = filterInventoryByPreferences(inventory, preferences, {
     collapsePriority: !isRefine,
   });
 
-  // If flavor/cooling narrowed to zero, relax those — but NEVER the product type
+  // Relax flavor/cooling/sweetness when empty — NEVER drop product type or selected brand
   if (!pool.length && preferences.productType) {
     pool = filterInventoryByPreferences(
       inventory,
@@ -889,7 +936,7 @@ async function advancePreferenceConversation(store, session, userMessage, invent
         productType: preferences.productType,
         flavorDirection: preferences.flavorDirection,
         specificFlavors: preferences.specificFlavors,
-        cooling: preferences.cooling,
+        brand: preferences.brand,
       },
       { collapsePriority: !isRefine }
     );
@@ -899,24 +946,22 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       inventory,
       {
         productType: preferences.productType,
-        flavorDirection: preferences.flavorDirection,
-        specificFlavors: preferences.specificFlavors,
+        brand: preferences.brand,
       },
-      { collapsePriority: !isRefine }
-    );
-  }
-  if (!pool.length && preferences.productType) {
-    pool = filterInventoryByPreferences(
-      inventory,
-      { productType: preferences.productType },
       { collapsePriority: !isRefine }
     );
   }
 
   if (!pool.length) {
-    const reply = preferences.productType
-      ? `I couldn't find a matching ${typeLabel.toLowerCase()} option for those preferences in this store's inventory. Want to try a different flavor, or a different product type?`
-      : "I couldn't find a match for those preferences. Tell me another product type or flavor and I'll search again.";
+    const reply = hasHardBrand
+      ? [
+          `I couldn't find a matching ${typeLabel.toLowerCase()} from ${brandLabel} for those preferences in this store's inventory.`,
+          '',
+          'Would you like to try another brand, say "No Preference" to browse any brand, or change the flavor / ice level?',
+        ].join('\n')
+      : preferences.productType
+        ? `I couldn't find a matching ${typeLabel.toLowerCase()} option for those preferences in this store's inventory. Want to try a different flavor, or a different product type?`
+        : "I couldn't find a match for those preferences. Tell me another product type or flavor and I'll search again.";
     session.funnelState = {
       phase: 'prefer',
       preferences,
@@ -924,7 +969,7 @@ async function advancePreferenceConversation(store, session, userMessage, invent
       path: [],
       candidateProductIds: [],
       excludedProductIds: activeState.excludedProductIds || [],
-      lastAsked: preferences.productType ? 'flavor' : 'productType',
+      lastAsked: hasHardBrand ? 'brand' : preferences.productType ? 'flavor' : 'productType',
       askAttempts: {},
       lastAskText: reply,
     };
@@ -938,28 +983,59 @@ async function advancePreferenceConversation(store, session, userMessage, invent
   }
 
   const excluded = new Set((activeState.excludedProductIds || []).map(String));
-  // Refine: hard-exclude prior cards while alternatives exist; relax filters before giving up.
+  // Refine: hard-exclude prior cards while alternatives exist; keep type + brand locks
   if (excluded.size) {
     const withoutPrev = pool.filter((p) => !excluded.has(String(p._id)));
     if (withoutPrev.length) {
       pool = withoutPrev;
     } else if (isRefine && preferences.productType) {
-      // Widen search but keep hard exclusion of already-shown products
       let widened = filterInventoryByPreferences(
         inventory,
-        { productType: preferences.productType, flavorDirection: preferences.flavorDirection },
+        {
+          productType: preferences.productType,
+          flavorDirection: preferences.flavorDirection,
+          brand: preferences.brand,
+        },
         { collapsePriority: false }
       );
       widened = widened.filter((p) => !excluded.has(String(p._id)));
       if (!widened.length) {
         widened = filterInventoryByPreferences(
           inventory,
-          { productType: preferences.productType },
+          { productType: preferences.productType, brand: preferences.brand },
           { collapsePriority: false }
         ).filter((p) => !excluded.has(String(p._id)));
       }
-      if (widened.length) pool = widened;
-      // else: keep original pool (may re-show) — only when truly no alternatives
+      if (widened.length) {
+        pool = widened;
+      } else if (hasHardBrand) {
+        const reply = [
+          `I've already suggested the closest ${brandLabel} matches for those preferences.`,
+          '',
+          'Want a different Relx flavor/ice level, another brand, or "No Preference" to look across all brands?',
+        ]
+          .join('\n')
+          .replace('Relx', brandLabel);
+        session.funnelState = {
+          phase: 'prefer',
+          preferences,
+          preferenceHints: preferences.rawHints || [],
+          excludedProductIds: [...excluded],
+          path: [],
+          candidateProductIds: [],
+          lastAsked: 'brand',
+          askAttempts: {},
+          lastAskText: reply,
+        };
+        return {
+          reply,
+          replyType: 'text',
+          options: [],
+          products: [],
+          funnel: session.funnelState,
+        };
+      }
+      // else: keep original pool (may re-show) — only when truly no alternatives and no hard brand
     }
   }
 
@@ -1405,7 +1481,24 @@ function scoreProductForPreferences(product, hint = '') {
   if (/\bcandy\b/.test(h) && /\b(candy|gummy)\b/.test(hay)) score += 4;
   if (/\bmenthol|mint\b/.test(h) && /\b(menthol|mint)\b/.test(hay)) score += 4;
   if (/\bfruity\b/.test(h) && /\b(fruit|berry|mango|peach|grape|melon|apple)\b/.test(hay)) score += 3;
+  // Brand names in the hint (e.g. "Allo | fruity | ice")
+  const brandTokens = String(hint || '')
+    .split('|')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s && !/^(e-?liquid|disposable|ice|sweet|fruity|any brand|any ice)/i.test(s));
+  for (const token of brandTokens) {
+    if (token.length >= 2 && (hay.includes(token) || foldBrand(product.brand).includes(token))) {
+      score += 8;
+      break;
+    }
+  }
   return score;
+}
+
+function foldBrand(value) {
+  return String(value || '')
+    .toLowerCase()
+    .trim();
 }
 
 async function pickBestProduct(store, pool, path, userHint, options = {}) {
@@ -1471,7 +1564,7 @@ async function pickBestProduct(store, pool, path, userHint, options = {}) {
           {
             role: 'system',
             content:
-              'Pick the single best inventory product for the customer based on their taste preferences (flavor, cooling/ice, sweetness, product type, overall experience). The customer may not know brands — choose the most suitable brand/product automatically from the candidates. Prefer PRIORITY items when they fit the refined request. Return JSON: {"productId":"...","reason":"short"}. Only use provided ids.' +
+              'Pick the single best inventory product for the customer based on their taste preferences (flavor, cooling/ice, sweetness, product type, brand, overall experience). If a brand is specified in the hint, ONLY choose that brand — never substitute another brand. Prefer PRIORITY items only when they still match the brand and preferences. Return JSON: {"productId":"...","reason":"short"}. Only use provided ids.' +
               avoidNote,
           },
           {

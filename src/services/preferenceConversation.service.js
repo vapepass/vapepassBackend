@@ -52,7 +52,7 @@ export function buildOpenShoppingPrompt(inventory = [], storeName = null, option
 
   return [
     ...intro,
-    "What are you looking for today? We carry E-Liquids, Disposables, Devices, Pods, and more. Just tell me what you're craving—like fruity, icy, or dessert flavors, a specific brand, or a disposable vibe—and I'll find it for you!",
+    "What are you looking for today? We carry E-Liquids, Disposables, Devices, Pods, and more. Just tell me what you're craving—like fruity, icy, or dessert flavors, or a specific brand—and I'll find it for you!",
   ].join('\n');
 }
 
@@ -74,6 +74,7 @@ export function extractShoppingPreferences(message) {
     specificFlavors: [],
     cooling: null,
     sweetness: null,
+    brand: null,
     rawHints: clean ? [clean] : [],
   };
 
@@ -103,8 +104,7 @@ export function extractShoppingPreferences(message) {
     prefs.flavorDirection = 'melon';
   } else if (hasToken('menthol') || hasToken('mint') || hasToken('minty')) {
     prefs.flavorDirection = 'menthol';
-    // Menthol/mint almost always implies a cooling finish
-    if (prefs.cooling == null) prefs.cooling = 'ice';
+    // Do NOT auto-set cooling — always ask ice / no-ice before brand + recommend
   } else if (hasToken('dessert') || hasToken('custard') || hasToken('vanilla') || hasToken('cream')) {
     prefs.flavorDirection = 'dessert';
   } else if (hasToken('candy') || hasToken('gummy')) {
@@ -213,7 +213,7 @@ export function applyRelativePreferenceDeltas(previous = {}, message = '') {
   }
   if (/\bmore menthol\b|\bmore mint\b/i.test(text)) {
     merged.flavorDirection = 'menthol';
-    if (!merged.cooling || merged.cooling === 'no_ice') merged.cooling = 'ice';
+    // Keep existing cooling; do not auto-force ice on refine
   }
   if (/\bmore dessert\b/i.test(text)) merged.flavorDirection = 'dessert';
 
@@ -235,6 +235,7 @@ export function mergePreferences(previous = {}, incoming = {}) {
   if (incoming.flavorDirection) next.flavorDirection = incoming.flavorDirection;
   if (incoming.cooling) next.cooling = incoming.cooling;
   if (incoming.sweetness) next.sweetness = incoming.sweetness;
+  if (incoming.brand) next.brand = incoming.brand;
 
   const flavors = [
     ...(Array.isArray(prev.specificFlavors) ? prev.specificFlavors : []),
@@ -296,8 +297,103 @@ export function evaluatePreferenceCompleteness(prefs = {}, inventory = []) {
     };
   }
 
-  // 'any' means user left ice open — ready to recommend
+  // Brand preference — REQUIRED before any recommendation (never skip)
+  if (p.brand == null || p.brand === '') {
+    const examples = listInventoryBrands(inventory, p.productType, 5);
+    const exampleText = examples.length
+      ? `${examples.join(', ')}, or any other brand available in our inventory`
+      : 'ABT, Allo, STLTH, Vice, or any other brand available in our inventory';
+    return {
+      ready: false,
+      missing: 'brand',
+      ask: `Do you have a preferred brand? For example: ${exampleText}. If you don't have a preference, simply reply with "No Preference."`,
+    };
+  }
+
+  // 'any' brand means no brand filter — ready to recommend
   return { ready: true, missing: null, ask: null };
+}
+
+const BRAND_NO_PREF_RE =
+  /\b(no preference|any brand|doesn't matter|doesnt matter|dont care|don't care|whatever|surprise me|you (pick|choose)|no brand)\b/i;
+
+/** Flavor / preference words that must never be treated as brand names */
+const FLAVOR_NOT_BRAND_RE =
+  /\b(fruit|fruity|ice|iced|icy|sweet|sweeter|dessert|candy|gummy|menthol|mint|minty|mango|berry|berries|citrus|tropical|melon|grape|peach|lemon|lime|orange|strawberry|blueberry|vanilla|tobacco|smooth|cooling|disposable|liquid|juice|pod|device|kit|accessory)\b/i;
+
+/**
+ * Top brands in inventory (optionally scoped to a product type).
+ */
+export function listInventoryBrands(inventory = [], productType = null, limit = 8) {
+  const counts = new Map();
+  for (const product of inventory) {
+    if (productType && !matchesProductType(product, productType)) continue;
+    const raw = String(product.brand || '').trim();
+    if (!raw || raw.length < 2) continue;
+    if (/^(n\/?a|none|unknown|null|undefined)$/i.test(raw)) continue;
+    if (FLAVOR_NOT_BRAND_RE.test(foldText(raw))) continue;
+    const key = raw.toLowerCase();
+    const prev = counts.get(key);
+    counts.set(key, { name: prev?.name || raw, n: (prev?.n || 0) + 1 });
+  }
+  return [...counts.values()]
+    .sort((a, b) => b.n - a.n || a.name.localeCompare(b.name))
+    .slice(0, limit)
+    .map((row) => row.name);
+}
+
+/**
+ * Resolve a brand preference from user text against inventory brands.
+ * Only call this when answering the brand question (or an explicit brand phrase).
+ * @returns {'any'|string|null} canonical brand name, 'any', or null if unresolved
+ */
+export function matchBrandPreference(message, inventory = [], productType = null) {
+  const clean = sanitizeUserHint(message);
+  const text = foldText(clean);
+  if (!text) return null;
+
+  if (
+    BRAND_NO_PREF_RE.test(text) ||
+    /^(no|none|nah|idk|n\/a|any)$/i.test(String(clean || '').trim())
+  ) {
+    return 'any';
+  }
+
+  // Never treat flavor / cooling answers as a brand
+  if (FLAVOR_NOT_BRAND_RE.test(text) && !/\bbrand\b/i.test(text)) {
+    return null;
+  }
+
+  const brands = listInventoryBrands(inventory, productType, 80).filter(
+    (b) => !FLAVOR_NOT_BRAND_RE.test(foldText(b))
+  );
+  const ranked = [...brands].sort((a, b) => b.length - a.length);
+  for (const brand of ranked) {
+    const folded = foldText(brand);
+    if (!folded || folded.length < 2) continue;
+    const escaped = folded.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (text === folded || new RegExp(`\\b${escaped}\\b`, 'i').test(text)) {
+      return brand;
+    }
+  }
+
+  // Short free-text answer while answering the brand question — accept as typed brand
+  if (clean && clean.length <= 40 && clean.split(/\s+/).length <= 4) {
+    if (!FLAVOR_NOT_BRAND_RE.test(clean)) {
+      return clean;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * True when the user is explicitly naming a brand (not a flavor answer).
+ */
+export function looksLikeExplicitBrandPhrase(message) {
+  const clean = sanitizeUserHint(message);
+  if (!clean) return false;
+  return /\b(brand|from|by)\s+[a-z0-9]/i.test(clean) || /\b[a-z0-9][a-z0-9 &\-]{1,30}\s+brand\b/i.test(clean);
 }
 
 function productHaystack(product) {
@@ -331,8 +427,9 @@ const TYPE_COMPAT = {
 };
 
 const TYPE_HAYSTACK_RE = {
-  e_liquid: /\b(e-?liquids?|e-?juices?|salt\s*nic|nic\s*salt|freebase)\b/i,
-  disposable: /\bdisposables?\b/i,
+  e_liquid: /\b(e-?liquids?|e-?juices?|salt\s*nic|nic\s*salt|freebase|refill)\b/i,
+  disposable:
+    /\b(disposables?|disposable\s*vapes?|puff\s*bar|vape\s*bar|\d{1,3}\s*k\s*puffs?|\d{1,3}(?:,\d{3})+\s*puffs?|up\s*to\s*\d[\d,]*\s*puffs?)\b/i,
   device: /\b(devices?|kits?|mods?|starter\s*kit)\b/i,
   pod: /\b(pods?|pod\s*system|pod\s*kit)\b/i,
   prefilled: /\b(pre-?filled|prefilled\s*pods?)\b/i,
@@ -343,9 +440,58 @@ const TYPE_HAYSTACK_RE = {
   pouch: /\bpouches?\b/i,
 };
 
+/** Strong disposable signals — used to block e-liquid recommendations from mis-typed SKUs */
+function looksLikeDisposable(product) {
+  const hay = productHaystack(product);
+  if (TYPE_HAYSTACK_RE.disposable.test(hay)) return true;
+  if (/\b(rechargeable\s*battery|smart\s*display|draw[- ]?activate)\b/i.test(hay) && /\bpuffs?\b/i.test(hay)) {
+    return true;
+  }
+  // High puff counts in the title are almost always disposables (e.g. MixPro 40K)
+  if (/\b\d{2,3}\s*k\b/i.test(`${product.name || ''} ${product.variantName || ''}`) && /\bpuff/i.test(hay)) {
+    return true;
+  }
+  return false;
+}
+
+/** Empty carts, 510s, coils, tanks — never recommend these as bottled e-liquid */
+function looksLikeHardwareOrEmptyCart(product) {
+  const hay = productHaystack(product);
+  if (
+    /\b(510|empty\s*cart|empty\s*cartridge|cartridges?|atomizers?|tanks?|coils?|drip\s*tips?|glass(?:ware)?|chargers?|batter(?:y|ies)|replacement\s*parts?|accessories)\b/i.test(
+      hay
+    )
+  ) {
+    // Allow real bottled juice that merely mentions "tank" in marketing copy only if clearly e-liquid
+    if (TYPE_HAYSTACK_RE.e_liquid.test(hay) && !/\b(510|empty\s*cart|empty\s*cartridge|cartridges?)\b/i.test(hay)) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 /**
- * Strict product-type match. Structured productType wins; haystack is only used
- * when the product is untyped/other — and never to cross into a conflicting type.
+ * Bottled e-liquid signals only — small ml sizes alone (0.5ml / 1ml carts) are NOT e-liquid.
+ */
+function looksLikeELiquid(product) {
+  const hay = productHaystack(product);
+  if (looksLikeHardwareOrEmptyCart(product) || looksLikeDisposable(product)) return false;
+  if (TYPE_HAYSTACK_RE.e_liquid.test(hay)) return true;
+
+  const volumeMatch = hay.match(/\b(\d+(?:\.\d+)?)\s*m[lL]\b/);
+  if (volumeMatch) {
+    const ml = Number(volumeMatch[1]);
+    // Typical bottled juice is > 2ml; ≤2ml is usually a pod/cart fill
+    if (Number.isFinite(ml) && ml > 2) return true;
+  }
+  return false;
+}
+
+/**
+ * Strict product-type match. Structured productType is respected, but clear
+ * conflicting signals in the title/description always win (e.g. a "disposable"
+ * or empty 510 cart miscategorized as e_liquid must not match an e-liquid request).
  */
 export function matchesProductType(product, productType) {
   if (!productType) return true;
@@ -353,21 +499,45 @@ export function matchesProductType(product, productType) {
   const wanted = String(productType).toLowerCase();
   const actual = String(product.productType || '').toLowerCase();
   const compatible = TYPE_COMPAT[wanted] || new Set([wanted]);
+  const disposableSignal = looksLikeDisposable(product);
+  const hardwareSignal = looksLikeHardwareOrEmptyCart(product);
+  const eLiquidSignal = looksLikeELiquid(product);
+  const hay = productHaystack(product);
+
+  // Haystack overrides mis-tagged Shopify types for the e-liquid boundary
+  if (wanted === 'e_liquid') {
+    if (disposableSignal || hardwareSignal || actual === 'disposable') return false;
+    if (['cartridge', 'coil', 'battery', 'accessory', 'device', 'pod', 'prefilled'].includes(actual)) {
+      return false;
+    }
+    // Never trust stored e_liquid alone when the title is clearly hardware
+    if (actual === 'e_liquid') {
+      return !hardwareSignal && !disposableSignal && (eLiquidSignal || TYPE_HAYSTACK_RE.e_liquid.test(hay));
+    }
+    if (actual === 'other' || !actual) {
+      return eLiquidSignal;
+    }
+    return compatible.has(actual);
+  }
+
+  if (wanted === 'disposable') {
+    if (disposableSignal) return true;
+    if (actual === 'disposable') return true;
+    if (hardwareSignal || (eLiquidSignal && !disposableSignal)) return false;
+    if (actual && actual !== 'other') return compatible.has(actual);
+    return TYPE_HAYSTACK_RE.disposable.test(hay);
+  }
 
   // Typed inventory row — enforce category strictly
   if (actual && actual !== 'other') {
     return compatible.has(actual);
   }
 
-  // Untyped / other — infer from title/category, but reject clear conflicts
-  const hay = productHaystack(product);
-  if (wanted !== 'e_liquid' && TYPE_HAYSTACK_RE.e_liquid.test(hay) && !TYPE_HAYSTACK_RE.pod.test(hay)) {
+  // Untyped / other — infer from title/category
+  if (wanted !== 'e_liquid' && TYPE_HAYSTACK_RE.e_liquid.test(hay) && !TYPE_HAYSTACK_RE.pod.test(hay) && !disposableSignal) {
     return false;
   }
-  if (wanted !== 'disposable' && TYPE_HAYSTACK_RE.disposable.test(hay)) {
-    return false;
-  }
-  if (wanted === 'e_liquid' && (TYPE_HAYSTACK_RE.disposable.test(hay) || TYPE_HAYSTACK_RE.device.test(hay))) {
+  if (wanted !== 'disposable' && disposableSignal) {
     return false;
   }
 
@@ -388,8 +558,38 @@ const FLAVOR_DIRECTION_RE = {
 };
 
 /**
+ * True when a product belongs to the requested brand (hard filter).
+ * Matches inventory `brand` first; also allows clear brand tokens in the title.
+ */
+export function matchesBrand(product, brand) {
+  if (!brand || brand === 'any') return true;
+  const needle = foldText(brand);
+  if (!needle || needle.length < 2) return true;
+
+  const productBrand = foldText(product?.brand || '');
+  if (productBrand) {
+    if (
+      productBrand === needle ||
+      productBrand.includes(needle) ||
+      needle.includes(productBrand)
+    ) {
+      return true;
+    }
+  }
+
+  // Title often starts with the brand even when brand field is messy
+  const name = foldText(product?.name || '');
+  if (name) {
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`\\b${escaped}\\b`, 'i').test(name)) return true;
+  }
+
+  return false;
+}
+
+/**
  * Filter inventory to products matching collected preferences.
- * Product type is a hard lock — never soft-fail into another category.
+ * Product type + selected brand are hard locks — never soft-fail into another category/brand.
  * @param {object[]} inventory
  * @param {object} prefs
  * @param {{ collapsePriority?: boolean }} [options]
@@ -402,6 +602,12 @@ export function filterInventoryByPreferences(inventory = [], prefs = {}, options
   if (prefs.productType) {
     pool = pool.filter((p) => matchesProductType(p, prefs.productType));
     // Hard lock: empty means "nothing in this category", not "use full catalog"
+    if (!pool.length) return [];
+  }
+
+  // Brand hard lock — apply BEFORE flavor/cooling so we never substitute another brand
+  if (prefs.brand && prefs.brand !== 'any') {
+    pool = pool.filter((p) => matchesBrand(p, prefs.brand));
     if (!pool.length) return [];
   }
 
@@ -448,8 +654,7 @@ export function filterInventoryByPreferences(inventory = [], prefs = {}, options
     if (lessSweet.length) pool = lessSweet;
   }
 
-  // Prefer priority promotions when present — still within the type-locked pool.
-  // Skip on refine so we can surface a different SKU than the sticky promo.
+  // Prefer priority promotions only inside the already brand+type locked pool
   if (collapsePriority) {
     const priority = pool.filter((p) => p.isPriorityPromotion);
     if (priority.length) return priority;
@@ -468,6 +673,8 @@ export function preferencesToHint(prefs = {}) {
   if (prefs.cooling === 'no_ice') bits.push('no ice');
   if (prefs.cooling === 'any') bits.push('any ice level');
   if (prefs.sweetness) bits.push(prefs.sweetness);
+  if (prefs.brand && prefs.brand !== 'any') bits.push(prefs.brand);
+  if (prefs.brand === 'any') bits.push('any brand');
   if (prefs.rawHints?.length) bits.push(prefs.rawHints[prefs.rawHints.length - 1]);
   return bits.filter(Boolean).join(' | ');
 }
@@ -479,6 +686,7 @@ export function emptyPreferences() {
     specificFlavors: [],
     cooling: null,
     sweetness: null,
+    brand: null,
     rawHints: [],
   };
 }
@@ -569,6 +777,17 @@ export function applyContextualAnswer(message, lastAsked, preferences = {}) {
     }
   }
 
+  if (lastAsked === 'brand') {
+    if (BRAND_NO_PREF_RE.test(t) || /^(no|none|nah|idk|n\/a)$/i.test(raw.trim())) {
+      next.brand = 'any';
+      return { preferences: next, unclear: null, resolved: true };
+    }
+    if (raw.trim()) {
+      next.brand = raw.trim();
+      return { preferences: next, unclear: null, resolved: true };
+    }
+  }
+
   return { preferences: next, unclear: null, resolved: false };
 }
 
@@ -646,6 +865,23 @@ export function buildContextualFollowUp(prefs, missing, meta = {}) {
       '',
       meta.defaultAsk ||
         'What type of product do you want — e-liquids, disposables, pods, or accessories?',
+    ].join('\n');
+  }
+
+  if (missing === 'brand') {
+    if (attempt >= 1) {
+      return [
+        summary ? `We've got ${summary}.` : 'Almost ready.',
+        '',
+        meta.defaultAsk ||
+          'Any preferred brand, or should I pick the best match with no brand preference?',
+      ].join('\n');
+    }
+    return [
+      summary ? `Perfect — ${summary}.` : 'Got it.',
+      '',
+      meta.defaultAsk ||
+        'Do you have a preferred brand? If not, just say "No Preference."',
     ].join('\n');
   }
 
