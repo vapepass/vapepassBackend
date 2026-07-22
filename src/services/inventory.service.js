@@ -50,10 +50,16 @@ export function buildWidgetScriptUrl() {
   return `${getApiPublicBase()}/widget.js`;
 }
 
-export function buildEmbedCode(storeId) {
+export function buildEmbedCode(_storeId) {
   // Widget stays hidden until the host site age gate sets age_verified / vapepass_site_age_verified.
   // After that, the loader iframes the Next.js /embed chat UI (same components as the marketing site).
-  return `<script src="${buildWidgetScriptUrl()}" data-store-id="${storeId}" async></script>`;
+  // Display/copy template uses placeholders — replace YOUR_API_HOST and YOUR_STORE_ID when installing.
+  return `<script
+  src="https://YOUR_API_HOST/widget.js"
+  data-store-id="YOUR_STORE_ID"
+  data-skip-site-age="true"
+  async
+></script>`;
 }
 
 async function upsertScrapedProduct(storeId, item, now) {
