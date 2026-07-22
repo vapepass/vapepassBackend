@@ -60,7 +60,6 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
     if (!data.productPageUrl) {
       data.productPageUrl = data.websiteUrl;
     }
-    data.inventorySyncStatus = 'pending';
   }
 
   if (data.productPageUrl) {
@@ -68,7 +67,6 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
     if (!data.websiteUrl) {
       data.websiteUrl = data.productPageUrl;
     }
-    data.inventorySyncStatus = 'pending';
   }
 
   // Authorized embed domain — replaces the previous one (single active hostname).
@@ -89,10 +87,6 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
     data.logo = await uploadImage(logoFile.buffer);
   }
 
-  const productUrlChanged =
-    (data.productPageUrl && data.productPageUrl !== store.productPageUrl) ||
-    (data.websiteUrl && data.websiteUrl !== store.websiteUrl);
-
   Object.assign(store, data);
 
   // Ensure legalAge stays aligned when location is updated via settings API
@@ -108,14 +102,8 @@ export const updateStoreSettings = async (user, updates, logoFile) => {
   if (passkit.templateId) store.passKitTemplateId = passkit.templateId;
   if (passkit.programId || passkit.templateId) await store.save();
 
-  // Kick off inventory scrape in the background when product page URL is set/changed
-  if (productUrlChanged) {
-    import('./inventory.service.js')
-      .then(({ syncStoreInventory }) => syncStoreInventory(store._id))
-      .catch((error) => {
-        console.error('[store] Inventory sync after settings update failed:', error.message);
-      });
-  }
+  // Do not auto-scrape when the website URL changes in Settings.
+  // Inventory import/refresh is started only from the AI Assistant page.
 
   return store;
 };

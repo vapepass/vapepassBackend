@@ -342,8 +342,9 @@ export async function stopInventorySync(user) {
 }
 
 /**
- * First inventory scrape after onboarding (URL + serviceable subscription).
- * Does not consume the monthly manual refresh quota.
+ * Optional helper for explicit/admin-triggered first sync.
+ * Not called after registration or payment — initial scrape starts only when
+ * the owner clicks "Save & Scrape Inventory" on the AI Assistant page.
  */
 export async function maybeRunInitialInventorySync(storeId) {
   const store = await Store.findById(storeId);
@@ -381,7 +382,7 @@ export async function refreshInventory(user) {
     throw new ApiError(400, 'Save your store website URL before refreshing inventory');
   }
 
-  // First-ever scrape is free (initial)
+  // First-ever scrape is free (initial) — same one-shot path as Save & Scrape
   if (!store.inventoryInitialSyncedAt) {
     store.inventorySyncStatus = 'syncing';
     store.inventorySyncError = null;
@@ -406,6 +407,7 @@ export async function refreshInventory(user) {
     );
   }
 
+  // Reserve a refresh slot for this UTC month before starting (enforces max 2)
   const monthKey = currentMonthKey();
   store.inventoryRefreshMonthKey = monthKey;
   store.inventoryRefreshCount = quota.used + 1;
@@ -533,11 +535,12 @@ export async function setProductPageUrl(user, productPageUrl, { syncNow = true }
   await store.save();
 
   if (syncNow) {
-    // Initial or URL-change sync — does not consume refresh quota when first-time
-    const isInitial = !store.inventoryInitialSyncedAt;
-    syncStoreInventory(store._id, { isInitial }).catch((error) => {
-      console.error('[inventory] Immediate sync after URL save failed:', error.message);
-    });
+    // One-time initial import only — later updates use Refresh Inventory (quota-limited).
+    if (!store.inventoryInitialSyncedAt) {
+      syncStoreInventory(store._id, { isInitial: true }).catch((error) => {
+        console.error('[inventory] Immediate sync after URL save failed:', error.message);
+      });
+    }
   }
 
   return Store.findById(store._id);
@@ -588,6 +591,16 @@ export async function getAssistantStatus(user) {
     store.setupCompletedAt && store.assistantEnabled && recommendable.length > 0 && subscriptionActive
   );
   const refreshQuota = getInventoryRefreshQuota(store);
+
+  // Backfill one-time scrape flag for stores that already imported inventory
+  if (
+    !store.inventoryInitialSyncedAt &&
+    (store.inventoryProductCount > 0 || products.length > 0) &&
+    (store.lastInventorySyncAt || store.inventorySyncStatus === 'success')
+  ) {
+    store.inventoryInitialSyncedAt = store.lastInventorySyncAt || new Date();
+    await store.save();
+  }
 
   // Live count while scraping so the dashboard updates before the job finishes
   let inventoryProductCount = store.inventoryProductCount || 0;

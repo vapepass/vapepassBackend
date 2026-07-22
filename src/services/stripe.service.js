@@ -113,7 +113,7 @@ async function activateStoreSubscription(store, stripeSubscription) {
     store.assistantEnabled = true;
   }
 
-  if (!wasActive) {
+    if (!wasActive) {
     const email = await getStoreOwnerEmail(store);
     if (email) {
       await sendSubscriptionActivatedEmail(email, {
@@ -123,13 +123,9 @@ async function activateStoreSubscription(store, stripeSubscription) {
       });
     }
 
-    // Auto-run first inventory scrape after subscription unlock + URL present
-    if (store.productPageUrl || store.websiteUrl) {
-      const { maybeRunInitialInventorySync } = await import('./inventory.service.js');
-      maybeRunInitialInventorySync(store._id).catch((error) => {
-        console.warn('[stripe] Initial inventory scrape failed:', error.message);
-      });
-    }
+    // Inventory scrape is intentionally NOT started here.
+    // Owners begin the initial import manually via "Save & Scrape Inventory"
+    // on the AI Assistant page.
   }
 }
 
