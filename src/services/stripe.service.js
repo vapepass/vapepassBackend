@@ -89,7 +89,11 @@ async function activateStoreSubscription(store, stripeSubscription) {
   if (stripeSubscription) {
     store.stripeSubscriptionId = stripeSubscription.id || store.stripeSubscriptionId;
     applyPeriodDates(store, stripeSubscription);
-    if (typeof stripeSubscription.cancel_at_period_end === 'boolean') {
+    // Never flip an explicit opt-out back to ON from a Stripe payload that
+    // still has cancel_at_period_end=false (collection drift). Prefer store flag.
+    if (store.autoRenew === false) {
+      /* keep false — ensureStripeMatchesAutoRenew heals Stripe separately */
+    } else if (typeof stripeSubscription.cancel_at_period_end === 'boolean') {
       store.autoRenew = !stripeSubscription.cancel_at_period_end;
     }
   }
@@ -130,9 +134,11 @@ async function activateStoreSubscription(store, stripeSubscription) {
 }
 
 /**
- * Update Stripe cancel_at_period_end to match autoRenew preference.
- * autoRenew ON  → cancel_at_period_end false (renews)
- * autoRenew OFF → cancel_at_period_end true  (ends after current period)
+ * Update Stripe so Auto Subscription preference is enforced end-to-end.
+ * autoRenew ON  → renews: cancel_at_period_end false, collection resumed
+ * autoRenew OFF → no automatic renewal/charges: cancel_at_period_end true,
+ *                 pause_collection, and stop auto_advance on open invoices
+ *                 (manual Retry Payment still uses invoices.pay).
  */
 async function syncStripeCancelAtPeriodEnd(store, autoRenew) {
   if (!store.stripeSubscriptionId || !isConfigured()) return null;
@@ -141,12 +147,91 @@ async function syncStripeCancelAtPeriodEnd(store, autoRenew) {
   const stripe = new Stripe(env.stripe.secretKey);
   const cancelAtPeriodEnd = !autoRenew;
 
-  const subscription = await stripe.subscriptions.update(store.stripeSubscriptionId, {
+  const updatePayload = {
     cancel_at_period_end: cancelAtPeriodEnd,
-  });
+  };
+
+  if (autoRenew) {
+    // Empty string clears pause_collection (Stripe API)
+    updatePayload.pause_collection = '';
+  } else {
+    updatePayload.pause_collection = { behavior: 'keep_as_draft' };
+  }
+
+  const subscription = await stripe.subscriptions.update(store.stripeSubscriptionId, updatePayload);
 
   applyPeriodDates(store, subscription);
+
+  if (!autoRenew) {
+    await stopAutomaticCollectionOnOpenInvoices(stripe, store);
+  }
+
   return subscription;
+}
+
+/**
+ * Halt Stripe Smart Retries / auto_advance on open invoices.
+ * Does not void invoices — manual retry can still call invoices.pay.
+ */
+async function stopAutomaticCollectionOnOpenInvoices(stripe, store) {
+  try {
+    const listParams = { status: 'open', limit: 10 };
+    if (store.stripeSubscriptionId) {
+      listParams.subscription = store.stripeSubscriptionId;
+    } else if (store.stripeCustomerId) {
+      listParams.customer = store.stripeCustomerId;
+    } else {
+      return;
+    }
+
+    const openInvoices = await stripe.invoices.list(listParams);
+    for (const invoice of openInvoices.data || []) {
+      if (!invoice?.id) continue;
+      if (invoice.auto_advance === false) continue;
+      try {
+        await stripe.invoices.update(invoice.id, { auto_advance: false });
+      } catch (error) {
+        console.warn(
+          `[billing] Unable to disable auto_advance on ${invoice.id}:`,
+          error.message
+        );
+      }
+    }
+  } catch (error) {
+    console.warn('[billing] Unable to stop open-invoice auto collection:', error.message);
+  }
+}
+
+/**
+ * Re-assert Stripe collection settings from the store's autoRenew flag.
+ * Used when billing sync / webhooks detect drift (e.g. portal changes).
+ */
+async function ensureStripeMatchesAutoRenew(store, subscription = null) {
+  if (!store?.stripeSubscriptionId || !isConfigured()) return subscription;
+
+  const wantsRenew = store.autoRenew !== false;
+  const cancelAtPeriodEnd = Boolean(subscription?.cancel_at_period_end);
+  const isPaused = Boolean(subscription?.pause_collection);
+
+  const drift =
+    (wantsRenew && (cancelAtPeriodEnd || isPaused)) ||
+    (!wantsRenew && (!cancelAtPeriodEnd || !isPaused));
+
+  if (!drift && wantsRenew) return subscription;
+  if (!drift && !wantsRenew) {
+    // Still stop any open invoice retries even if cancel_at_period_end already true
+    const Stripe = (await import('stripe')).default;
+    const stripe = new Stripe(env.stripe.secretKey);
+    await stopAutomaticCollectionOnOpenInvoices(stripe, store);
+    return subscription;
+  }
+
+  try {
+    return await syncStripeCancelAtPeriodEnd(store, wantsRenew);
+  } catch (error) {
+    console.warn('[billing] Unable to re-sync autoRenew to Stripe:', error.message);
+    return subscription;
+  }
 }
 
 /**
@@ -585,10 +670,22 @@ export const handleWebhookEvent = async (event) => {
     case 'customer.subscription.updated': {
       store.stripeSubscriptionId = obj.id;
       applyPeriodDates(store, obj);
+
+      // Keep local Auto Subscription preference as source of truth when set.
+      // Still accept Stripe cancel_at_period_end when the store has no explicit false
+      // (e.g. customer cancelled via Billing Portal → mirror as autoRenew OFF).
       if (typeof obj.cancel_at_period_end === 'boolean') {
-        store.autoRenew = !obj.cancel_at_period_end;
-        store.autoRenewUpdatedAt = store.autoRenewUpdatedAt || new Date();
+        if (store.autoRenew === false) {
+          // User opted out — re-assert Stripe if portal/webhook drifted
+          if (!obj.cancel_at_period_end || !obj.pause_collection) {
+            await ensureStripeMatchesAutoRenew(store, obj);
+          }
+        } else {
+          store.autoRenew = !obj.cancel_at_period_end;
+          store.autoRenewUpdatedAt = store.autoRenewUpdatedAt || new Date();
+        }
       }
+
       const mapped = mapStripeSubscriptionStatus(obj.status);
 
       if (mapped === SUBSCRIPTION_STATUS.ACTIVE) {
@@ -602,6 +699,16 @@ export const handleWebhookEvent = async (event) => {
         store.stripeSubscriptionId = null;
       } else if (mapped === SUBSCRIPTION_STATUS.PAST_DUE) {
         store.subscriptionStatus = SUBSCRIPTION_STATUS.PAST_DUE;
+        if (store.autoRenew === false && isConfigured()) {
+          try {
+            const Stripe = (await import('stripe')).default;
+            const stripe = new Stripe(env.stripe.secretKey);
+            await ensureStripeMatchesAutoRenew(store, obj);
+            await stopAutomaticCollectionOnOpenInvoices(stripe, store);
+          } catch (error) {
+            console.warn('[billing] past_due autoRenew halt failed:', error.message);
+          }
+        }
       } else if (mapped) {
         store.subscriptionStatus = mapped;
       }
@@ -632,16 +739,34 @@ export const handleWebhookEvent = async (event) => {
       store.lastPaymentFailedAt = new Date();
       store.paymentRetryCount = (store.paymentRetryCount || 0) + 1;
 
+      const autoRenewEnabled = store.autoRenew !== false;
+
+      // Auto Subscription OFF → stop Stripe from retrying this invoice automatically
+      if (!autoRenewEnabled && isConfigured()) {
+        try {
+          const Stripe = (await import('stripe')).default;
+          const stripe = new Stripe(env.stripe.secretKey);
+          if (obj?.id) {
+            await stripe.invoices.update(obj.id, { auto_advance: false }).catch(() => {});
+          }
+          await ensureStripeMatchesAutoRenew(store);
+          await stopAutomaticCollectionOnOpenInvoices(stripe, store);
+        } catch (error) {
+          console.warn('[billing] Failed to halt auto-retries after payment_failed:', error.message);
+        }
+      }
+
       const email = await getStoreOwnerEmail(store);
       if (email) {
         await sendPaymentFailedEmail(email, {
           storeName: store.name,
-          retryAttempted: store.paymentRetryCount <= MAX_PAYMENT_RETRIES,
+          // Only promise automatic retries when Auto Subscription is still ON
+          retryAttempted: autoRenewEnabled && store.paymentRetryCount <= MAX_PAYMENT_RETRIES,
         });
       }
 
-      // After 1–2 automatic retries fail, pause service
-      if (store.paymentRetryCount >= MAX_PAYMENT_RETRIES) {
+      // After 1–2 automatic retries fail, pause service (only relevant when auto-renew is ON)
+      if (autoRenewEnabled && store.paymentRetryCount >= MAX_PAYMENT_RETRIES) {
         await pauseStoreForFailedPayment(store);
       }
       break;
@@ -685,6 +810,9 @@ async function syncStoreBillingStatusFromStripe(store) {
       subscription = await stripe.subscriptions.retrieve(store.stripeSubscriptionId);
       stripeStatus = subscription.status;
       applyPeriodDates(store, subscription);
+      // Keep Stripe collection aligned with Auto Subscription toggle
+      subscription = (await ensureStripeMatchesAutoRenew(store, subscription)) || subscription;
+      stripeStatus = subscription.status || stripeStatus;
     }
 
     const mapped = mapStripeSubscriptionStatus(stripeStatus);
@@ -693,6 +821,11 @@ async function syncStoreBillingStatusFromStripe(store) {
       Boolean(openInvoice) &&
       Number(openInvoice.amount_due || 0) > 0 &&
       ['open', 'uncollectible'].includes(openInvoice.status);
+
+    // Auto Subscription OFF: never leave open invoices on auto-retry
+    if (store.autoRenew === false && hasUnpaidRenewal) {
+      await stopAutomaticCollectionOnOpenInvoices(stripe, store);
+    }
 
     let dirty = false;
 

@@ -84,7 +84,8 @@ const storeSchema = new mongoose.Schema(
     },
     /**
      * Auto Subscription (auto-renew). Default ON for new stores.
-     * When false, Stripe subscription is set to cancel_at_period_end.
+     * When false: Stripe cancel_at_period_end + paused collection — no automatic
+     * renewal charges; manual Retry Payment remains available.
      */
     autoRenew: {
       type: Boolean,

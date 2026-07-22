@@ -20,6 +20,7 @@ export async function sendUpcomingRenewalReminders() {
 
   const stores = await Store.find({
     subscriptionStatus: SUBSCRIPTION_STATUS.ACTIVE,
+    autoRenew: { $ne: false },
     nextBillingDate: { $gte: windowStart, $lte: windowEnd },
     $or: [
       { renewalReminderSentAt: null },
