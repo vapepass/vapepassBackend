@@ -14,9 +14,9 @@ export const env = {
   port: parseInt(process.env.PORT, 10) || 5000,
   mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/vapepass',
   jwtSecret: process.env.JWT_SECRET,
-  jwtExpires: process.env.JWT_EXPIRES || '15m',
+  jwtExpires: process.env.JWT_EXPIRES || '7d',
   jwtRefreshSecret: process.env.JWT_REFRESH_SECRET,
-  jwtRefreshExpires: process.env.JWT_REFRESH_EXPIRES || '7d',
+  jwtRefreshExpires: process.env.JWT_REFRESH_EXPIRES || '30d',
   clientUrl: process.env.CLIENT_URL || 'http://localhost:3000',
   /** Comma-separated hostnames allowed as marketing/demo chatbot origins */
   marketingDemoHosts: String(process.env.MARKETING_DEMO_HOSTS || '')
